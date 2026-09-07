@@ -102,4 +102,4 @@ CI выполняется на GitHub-hosted `ubuntu-latest`.
 
 ## Лицензия
 
-Лицензия и third-party notices будут сохранены вместе с extracted runtime до merge Prototype.
+Проект распространяется под GNU GPL v3. Third-party лицензии и provenance сохранены в [NOTICE.md](NOTICE.md) и `third_party/`.
