@@ -1,0 +1,10 @@
+/.gradle/
+/**/build/
+/local.properties
+/artifacts/
+/core/src/main/jniLibs/**/*.so
+*.aar
+*.apk
+*.aab
+.idea/
+*.iml
