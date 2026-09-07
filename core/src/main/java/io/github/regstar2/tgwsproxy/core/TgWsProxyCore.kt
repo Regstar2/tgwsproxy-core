@@ -151,7 +151,7 @@ internal fun parseNativeStatus(raw: String): TgWsProxyStatus {
         outbound = fields["outbound"].orEmpty(),
         selectedBackend = fields["selected_backend"].orEmpty(),
         actualBackend = fields["actual_backend"].orEmpty(),
-        fallbackUsed = fields["fallback_used"].toBooleanStrictOrNull() ?: false,
+        fallbackUsed = fields["fallback_used"]?.toBooleanStrictOrNull() ?: false,
         routeReason = fields["route_reason"].orEmpty(),
         activeConnections = fields["active"]?.toLongOrNull() ?: 0,
         totalConnections = fields["total"]?.toLongOrNull() ?: 0,
