@@ -1,0 +1,1 @@
+-keep interface io.github.regstar2.tgwsproxy.core.TgWsNativeLibrary { *; }
