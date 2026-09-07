@@ -37,7 +37,7 @@ gradle :core:assembleDebug
 
 ## Требования
 
-- Android minSdk 26;
+- Android minSdk 21;
 - compileSdk 35;
 - ABI: `arm64-v8a`;
 - Go 1.25;
@@ -95,7 +95,7 @@ CI выполняется на GitHub-hosted `ubuntu-latest`.
 ## Ограничения
 
 - только `arm64-v8a`;
-- minSdk 26;
+- minSdk 21;
 - JNA остаётся отдельной Gradle dependency;
 - Maven/GitHub Packages publication пока нет;
 - `tg-ws-proxy-android` пока продолжает использовать собственную копию runtime.
