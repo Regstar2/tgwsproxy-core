@@ -14,6 +14,21 @@ try {
     Pop-Location
 }
 
+$consumerRulesPath = Join-Path $root "core/consumer-rules.pro"
+$consumerRules = Get-Content $consumerRulesPath -Raw
+
+$requiredRules = @(
+    '-keep class com.sun.jna.** { *; }',
+    '-keep interface com.sun.jna.Library { *; }',
+    '-keep interface io.github.regstar2.tgwsproxy.core.TgWsNativeLibrary { *; }',
+    '-keepclassmembers class * extends com.sun.jna.Library'
+)
+foreach ($rule in $requiredRules) {
+    if ($consumerRules -notmatch [regex]::Escape($rule)) {
+        throw "Missing required consumer ProGuard rule: $rule"
+    }
+}
+
 $gradle = Get-Command gradle -ErrorAction Stop
 & $gradle.Source :core:testDebugUnitTest :core:assembleDebug
 if ($LASTEXITCODE -ne 0) { throw "Gradle build failed" }
