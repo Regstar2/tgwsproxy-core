@@ -44,6 +44,7 @@ gradle :core:assembleDebug
 - AGP 8.2.2;
 - Kotlin 1.9.22;
 - JNA 5.14.0.
+- consumer ProGuard rules сохраняют JNA JNI entrypoints при R8/minification.
 
 ## Использование
 
