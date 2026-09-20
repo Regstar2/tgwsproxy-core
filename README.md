@@ -9,7 +9,7 @@
 
 ## О проекте
 
-Исходный runtime извлекается из `Regstar2/tg-ws-proxy-android` commit `b2558f16f8a46aa3abec2660acd606bffdfac613`. Исходный репозиторий при extraction не изменяется.
+Native runtime синхронизирован с `Regstar2/tg-ws-proxy-android` commit `c5c4d03ce6f731642cfd5d66d0bdc56377606831` (v1.11.0). Исходный Android-репозиторий при синхронизации не изменяется.
 
 ## Статус проекта
 
@@ -20,7 +20,9 @@
 ## Возможности
 
 - локальный MTProto frontend;
-- WebSocket/Cloudflare route runtime;
+- Cloudflare Proxy, Direct WebSocket и Cloudflare Worker routes;
+- AWG/WARP userspace runtime из v1.11.0;
+- актуальные route health/cooldown, Worker failover и WebSocket transport improvements;
 - минимальный Kotlin API;
 - сборка `libtgwsproxy.so` из включённого Go source;
 - без Compose, Activity, Service и Telegram classes.
@@ -99,7 +101,7 @@ CI выполняется на GitHub-hosted `ubuntu-latest`.
 - minSdk 21;
 - JNA остаётся отдельной Gradle dependency;
 - Maven/GitHub Packages publication пока нет;
-- `tg-ws-proxy-android` пока продолжает использовать собственную копию runtime.
+- Android app и core синхронизируются явно по pinned source commit.
 
 ## Лицензия
 
