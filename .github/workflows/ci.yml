@@ -30,6 +30,8 @@ jobs:
           go-version: "1.25.x"
           cache-dependency-path: native/tgwsproxy/go.sum
 
+      - uses: android-actions/setup-android@v3
+
       - name: Install Android SDK components
         shell: bash
         run: |
