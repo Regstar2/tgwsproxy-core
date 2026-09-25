@@ -19,19 +19,39 @@ const (
 	CFFailureWebSocket CFFailureKind = "websocket"
 )
 
-const cachedUpstreamDNSCooldownSeconds = 6 * 60 * 60
+const (
+	cachedUpstreamDNSCooldownSeconds = 6 * 60 * 60
+	cachedUpstreamSourceScoreBonus   = 4
+	cfDomainExplorationInterval      = 5
+	cfDomainExplorationMaxScoreGap   = 40
+)
+
+type cfDomainHealthKey struct {
+	DC     int
+	Domain string
+}
 
 type CFDomainHealth struct {
-	Domain              string
-	Source              CFDomainSource
-	SuccessCount        int
-	FailureCount        int
+	DC     int
+	Domain string
+	Source CFDomainSource
+
+	// SuccessCount is the number of successful CF route completions recorded for this endpoint.
+	SuccessCount int
+	// FailureCount counts failure bursts that actually applied cooldown; duplicate callbacks
+	// arriving while that cooldown is active do not increment it.
+	FailureCount int
+	// ConsecutiveFailures counts sequential, cooldown-applying failure bursts since the last success.
 	ConsecutiveFailures int
 	LastSuccessAt       float64
-	LastFailureAt       float64
-	LastFailureReason   CFFailureKind
-	CooldownUntil       float64
-	LastLatencyMs       int64
+	// LastFailureAt and LastFailureReason describe the latest counted failure burst, not a
+	// duplicate callback coalesced into an already-active cooldown.
+	LastFailureAt     float64
+	LastFailureReason CFFailureKind
+	// CooldownUntil belongs to the latest counted failure burst and is never extended solely
+	// by duplicate callbacks that arrive before it expires.
+	CooldownUntil float64
+	LastLatencyMs int64
 }
 
 type CFDomainCandidate struct {
@@ -44,6 +64,7 @@ type CFDomainCandidate struct {
 type CFDomainSelection struct {
 	Candidates      []CFDomainCandidate
 	SkippedCooldown []CFDomainHealth
+	SkippedInFlight []CFDomainHealth
 }
 
 type CFDomainPool struct {
@@ -51,8 +72,10 @@ type CFDomainPool struct {
 	manual         []string
 	cachedUpstream []string
 	builtin        []string
-	health         map[string]*CFDomainHealth
+	health         map[cfDomainHealthKey]*CFDomainHealth
+	inFlight       map[cfDomainHealthKey]struct{}
 	dcPreferred    map[int]string
+	selectionCount map[int]uint64
 	cachedCursor   int
 	builtinCursor  int
 	now            func() float64
@@ -65,9 +88,11 @@ func NewCFDomainPool(now func() float64) *CFDomainPool {
 		}
 	}
 	return &CFDomainPool{
-		health:      make(map[string]*CFDomainHealth),
-		dcPreferred: make(map[int]string),
-		now:         now,
+		health:         make(map[cfDomainHealthKey]*CFDomainHealth),
+		inFlight:       make(map[cfDomainHealthKey]struct{}),
+		dcPreferred:    make(map[int]string),
+		selectionCount: make(map[int]uint64),
+		now:            now,
 	}
 }
 
@@ -75,9 +100,6 @@ func (p *CFDomainPool) SetBuiltinDomains(domains []string) {
 	normalized := NormalizeCFDomains(domains)
 	p.mu.Lock()
 	p.builtin = normalized
-	for _, domain := range normalized {
-		p.ensureHealthLocked(domain, CFDomainSourceBuiltIn)
-	}
 	p.reclassifyRemovedDomainsLocked()
 	p.mu.Unlock()
 }
@@ -86,9 +108,6 @@ func (p *CFDomainPool) SetCachedUpstreamDomains(domains []string) {
 	normalized := NormalizeCachedUpstreamCFDomains(domains)
 	p.mu.Lock()
 	p.cachedUpstream = normalized
-	for _, domain := range normalized {
-		p.ensureHealthLocked(domain, CFDomainSourceCachedUpstream)
-	}
 	p.reclassifyRemovedDomainsLocked()
 	p.mu.Unlock()
 }
@@ -101,9 +120,6 @@ func (p *CFDomainPool) SetManualDomains(domains []string) []string {
 	normalized := NormalizeCFDomains(domains)
 	p.mu.Lock()
 	p.manual = normalized
-	for _, domain := range normalized {
-		p.ensureHealthLocked(domain, CFDomainSourceManual)
-	}
 	p.reclassifyRemovedDomainsLocked()
 	p.mu.Unlock()
 	return normalized
@@ -113,7 +129,44 @@ func (p *CFDomainPool) ClearManualDomain() {
 	p.SetManualDomains(nil)
 }
 
-func (p *CFDomainPool) MarkFailure(domain string, kind CFFailureKind, latencyMs int64) CFDomainHealth {
+func (p *CFDomainPool) TryReserve(dc int, domain string) bool {
+	normalized, ok := NormalizeCFDomain(domain)
+	if !ok {
+		return false
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	key := cfDomainHealthKey{DC: dc, Domain: normalized}
+	health := p.ensureHealthLocked(dc, normalized, p.sourceForLocked(normalized))
+	if p.now() < health.CooldownUntil {
+		return false
+	}
+	if _, exists := p.inFlight[key]; exists {
+		return false
+	}
+	p.inFlight[key] = struct{}{}
+	return true
+}
+
+func (p *CFDomainPool) ReleaseReservation(dc int, domain string) {
+	normalized, ok := NormalizeCFDomain(domain)
+	if !ok {
+		return
+	}
+
+	p.mu.Lock()
+	delete(p.inFlight, cfDomainHealthKey{DC: dc, Domain: normalized})
+	p.mu.Unlock()
+}
+
+// MarkFailure records one penalty-bearing failure burst. Once a failure has established
+// cooldown, additional callbacks for the same endpoint are coalesced until that cooldown
+// expires. TryReserve prevents a legitimate retry from starting during that interval, so
+// those callbacks can only belong to attempts that were already in progress when the
+// first failure was recorded. A retry after cooldown expiry is counted normally.
+func (p *CFDomainPool) MarkFailure(dc int, domain string, kind CFFailureKind, latencyMs int64) CFDomainHealth {
 	normalized, ok := NormalizeCFDomain(domain)
 	if !ok {
 		return CFDomainHealth{}
@@ -122,9 +175,15 @@ func (p *CFDomainPool) MarkFailure(domain string, kind CFFailureKind, latencyMs 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	key := cfDomainHealthKey{DC: dc, Domain: normalized}
 	source := p.sourceForLocked(normalized)
-	health := p.ensureHealthLocked(normalized, source)
+	health := p.ensureHealthLocked(dc, normalized, source)
 	now := p.now()
+	if now < health.CooldownUntil {
+		delete(p.inFlight, key)
+		return *health
+	}
+
 	health.FailureCount++
 	health.ConsecutiveFailures++
 	health.LastFailureAt = now
@@ -136,6 +195,7 @@ func (p *CFDomainPool) MarkFailure(domain string, kind CFFailureKind, latencyMs 
 	if source == CFDomainSourceCachedUpstream && IsCFDNSFailure(kind) {
 		health.CooldownUntil = now + cachedUpstreamDNSCooldownSeconds
 	}
+	delete(p.inFlight, key)
 	return *health
 }
 
@@ -148,7 +208,7 @@ func (p *CFDomainPool) MarkSuccess(dc int, domain string, latencyMs int64) CFDom
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	health := p.ensureHealthLocked(normalized, p.sourceForLocked(normalized))
+	health := p.ensureHealthLocked(dc, normalized, p.sourceForLocked(normalized))
 	health.SuccessCount++
 	health.ConsecutiveFailures = 0
 	health.LastSuccessAt = p.now()
@@ -169,7 +229,7 @@ func (p *CFDomainPool) ResetCooldowns() {
 	p.mu.Unlock()
 }
 
-func (p *CFDomainPool) IsCoolingDown(domain string) bool {
+func (p *CFDomainPool) IsCoolingDown(dc int, domain string) bool {
 	normalized, ok := NormalizeCFDomain(domain)
 	if !ok {
 		return false
@@ -177,7 +237,7 @@ func (p *CFDomainPool) IsCoolingDown(domain string) bool {
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	health, exists := p.health[normalized]
+	health, exists := p.health[cfDomainHealthKey{DC: dc, Domain: normalized}]
 	return exists && p.now() < health.CooldownUntil
 }
 
@@ -198,15 +258,20 @@ func (p *CFDomainPool) SelectionForDC(dc int) CFDomainSelection {
 		}
 		seen[domain] = struct{}{}
 
-		health := p.ensureHealthLocked(domain, source)
+		key := cfDomainHealthKey{DC: dc, Domain: domain}
+		health := p.ensureHealthLocked(dc, domain, source)
 		if now < health.CooldownUntil {
 			selection.SkippedCooldown = append(selection.SkippedCooldown, *health)
+			return
+		}
+		if _, exists := p.inFlight[key]; exists {
+			selection.SkippedInFlight = append(selection.SkippedInFlight, *health)
 			return
 		}
 		selection.Candidates = append(selection.Candidates, CFDomainCandidate{
 			Domain: domain,
 			Source: source,
-			Score:  scoreHealth(*health),
+			Score:  scoreHealth(*health, now),
 			Health: *health,
 		})
 	}
@@ -235,11 +300,22 @@ func (p *CFDomainPool) SelectionForDC(dc int) CFDomainSelection {
 	sort.SliceStable(selection.Candidates, func(i, j int) bool {
 		left := selection.Candidates[i]
 		right := selection.Candidates[j]
-		if left.Source != right.Source {
-			return sourcePriority(left.Source) < sourcePriority(right.Source)
+		if left.Source == CFDomainSourceManual || right.Source == CFDomainSourceManual {
+			if left.Source == right.Source {
+				return false
+			}
+			return left.Source == CFDomainSourceManual
 		}
-		return left.Score > right.Score
+		if left.Score != right.Score {
+			return left.Score > right.Score
+		}
+		return sourcePriority(left.Source) < sourcePriority(right.Source)
 	})
+
+	p.selectionCount[dc]++
+	if p.selectionCount[dc]%cfDomainExplorationInterval == 0 {
+		promoteExplorationCandidate(selection.Candidates)
+	}
 
 	return selection
 }
@@ -256,23 +332,26 @@ func (p *CFDomainPool) Snapshot() []CFDomainHealth {
 		if out[i].Source != out[j].Source {
 			return sourcePriority(out[i].Source) < sourcePriority(out[j].Source)
 		}
-		return out[i].Domain < out[j].Domain
+		if out[i].Domain != out[j].Domain {
+			return out[i].Domain < out[j].Domain
+		}
+		return out[i].DC < out[j].DC
 	})
 	return out
 }
 
-func (p *CFDomainPool) ensureHealthLocked(domain string, source CFDomainSource) *CFDomainHealth {
-	if health, ok := p.health[domain]; ok {
-		if sourcePriority(source) < sourcePriority(health.Source) {
-			health.Source = source
-		}
+func (p *CFDomainPool) ensureHealthLocked(dc int, domain string, source CFDomainSource) *CFDomainHealth {
+	key := cfDomainHealthKey{DC: dc, Domain: domain}
+	if health, ok := p.health[key]; ok {
+		health.Source = source
 		return health
 	}
 	health := &CFDomainHealth{
+		DC:     dc,
 		Domain: domain,
 		Source: source,
 	}
-	p.health[domain] = health
+	p.health[key] = health
 	return health
 }
 
@@ -309,17 +388,24 @@ func (p *CFDomainPool) rotatedBuiltinsLocked() []string {
 }
 
 func (p *CFDomainPool) reclassifyRemovedDomainsLocked() {
-	for domain, health := range p.health {
+	for key, health := range p.health {
 		switch {
-		case containsDomain(p.manual, domain):
+		case containsDomain(p.manual, key.Domain):
 			health.Source = CFDomainSourceManual
-		case containsDomain(p.cachedUpstream, domain):
+		case containsDomain(p.cachedUpstream, key.Domain):
 			health.Source = CFDomainSourceCachedUpstream
-		case containsDomain(p.builtin, domain):
+		case containsDomain(p.builtin, key.Domain):
 			health.Source = CFDomainSourceBuiltIn
 		default:
-			delete(p.health, domain)
+			delete(p.health, key)
+			delete(p.inFlight, key)
 		}
+	}
+	for key := range p.inFlight {
+		if containsDomain(p.manual, key.Domain) || containsDomain(p.cachedUpstream, key.Domain) || containsDomain(p.builtin, key.Domain) {
+			continue
+		}
+		delete(p.inFlight, key)
 	}
 }
 
@@ -350,18 +436,92 @@ func IsCFDNSFailure(kind CFFailureKind) bool {
 	return kind == CFFailureDNS
 }
 
-func scoreHealth(health CFDomainHealth) int {
+func scoreHealth(health CFDomainHealth, now float64) int {
 	score := 100
-	score += health.SuccessCount * 6
-	score -= health.FailureCount * 4
-	score -= health.ConsecutiveFailures * 15
+	score += minInt(health.SuccessCount, 3) * 2
+	score -= decayedFailurePenalty(health, now)
 	if health.LastLatencyMs > 0 {
-		score -= int(health.LastLatencyMs / 250)
+		score -= minInt(int(health.LastLatencyMs/250), 12)
+	}
+	if health.LastSuccessAt > 0 && health.LastSuccessAt >= health.LastFailureAt {
+		score += recentSuccessBonus(now - health.LastSuccessAt)
+	}
+	if health.Source == CFDomainSourceCachedUpstream {
+		score += cachedUpstreamSourceScoreBonus
 	}
 	if health.Source == CFDomainSourceManual {
 		score += 1000
 	}
 	return score
+}
+
+func recentSuccessBonus(ageSeconds float64) int {
+	switch {
+	case ageSeconds < 0:
+		return 0
+	case ageSeconds <= 5*60:
+		return 30
+	case ageSeconds <= 30*60:
+		return 15
+	case ageSeconds <= 2*60*60:
+		return 5
+	default:
+		return 0
+	}
+}
+
+func decayedFailurePenalty(health CFDomainHealth, now float64) int {
+	if health.LastFailureAt <= 0 {
+		return 0
+	}
+	ageSeconds := now - health.LastFailureAt
+	if ageSeconds < 0 {
+		return 0
+	}
+
+	penalty := minInt(health.FailureCount, 5)*4 + minInt(health.ConsecutiveFailures, 5)*12
+	switch {
+	case ageSeconds <= 10*60:
+		return penalty
+	case ageSeconds <= 60*60:
+		return penalty / 2
+	case ageSeconds <= 6*60*60:
+		return penalty / 4
+	default:
+		return 0
+	}
+}
+
+func promoteExplorationCandidate(candidates []CFDomainCandidate) {
+	firstNonManual := 0
+	for firstNonManual < len(candidates) && candidates[firstNonManual].Source == CFDomainSourceManual {
+		firstNonManual++
+	}
+	if len(candidates)-firstNonManual < 2 {
+		return
+	}
+
+	bestScore := candidates[firstNonManual].Score
+	explorationIndex := -1
+	oldestObservation := 0.0
+	for i := firstNonManual + 1; i < len(candidates); i++ {
+		candidate := candidates[i]
+		if bestScore-candidate.Score > cfDomainExplorationMaxScoreGap {
+			continue
+		}
+		observation := maxFloat(candidate.Health.LastSuccessAt, candidate.Health.LastFailureAt)
+		if explorationIndex == -1 || observation < oldestObservation {
+			explorationIndex = i
+			oldestObservation = observation
+		}
+	}
+	if explorationIndex == -1 {
+		return
+	}
+
+	exploration := candidates[explorationIndex]
+	copy(candidates[firstNonManual+1:explorationIndex+1], candidates[firstNonManual:explorationIndex])
+	candidates[firstNonManual] = exploration
 }
 
 func sourcePriority(source CFDomainSource) int {
@@ -382,6 +542,13 @@ func containsDomain(domains []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func maxFloat(a, b float64) float64 {

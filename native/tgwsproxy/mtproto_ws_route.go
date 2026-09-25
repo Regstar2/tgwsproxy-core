@@ -85,17 +85,13 @@ func (c *mtProtoDirectWSConnector) Connect(
 	timedOut := false
 	for _, domain := range domains {
 		prefix := fmt.Sprintf("[MTProto] DC%d%s direct_ws", request.DCID, mediaTag(request.IsMedia))
-		if logInfo != nil {
-			logInfo.Printf(
-				"MTProto route truth frontend=MTProto selected_backend=%s actual_backend=none fallback_used=false reason=connecting dc=%d media=%t transport=%s target=%s domain=%s",
-				mtProtoDirectWSBackend,
-				request.DCID,
-				request.IsMedia,
-				request.Transport,
-				target,
-				domain,
-			)
-		}
+		logMtProtoRouteAttempt(
+			request,
+			routeDirectWS,
+			"target=%s domain=%s",
+			target,
+			domain,
+		)
 
 		ws, err := c.dial(target, domain, path, 10)
 		if err != nil {
@@ -218,25 +214,21 @@ func (c *mtProtoCFProxyConnector) Connect(
 		baseDomain := candidate.Domain
 		host := cfProxyHost(wsDC, baseDomain)
 		prefix := fmt.Sprintf("[MTProto] DC%d%s cfproxy", request.DCID, mediaTag(request.IsMedia))
-		if logInfo != nil {
-			logInfo.Printf(
-				"MTProto route truth frontend=MTProto selected_backend=%s actual_backend=none fallback_used=false reason=connecting dc=%d media=%t transport=%s host=%s pool_domain=%s source=%s",
-				mtProtoCFProxyBackend,
-				request.DCID,
-				request.IsMedia,
-				request.Transport,
-				host,
-				baseDomain,
-				candidate.Source,
-			)
-		}
+		logMtProtoRouteAttempt(
+			request,
+			routeCFProxyWS,
+			"host=%s pool_domain=%s source=%s",
+			host,
+			baseDomain,
+			candidate.Source,
+		)
 
 		ws, err := c.dial(host, "/apiws", prefix)
 		if err != nil {
 			lastErr = err
 			kind := classifyCFFailure(err)
 			lastReason = string(kind)
-			health := cfPool.MarkFailure(baseDomain, kind, 0)
+			health := cfPool.MarkFailure(wsDC, baseDomain, kind, 0)
 			if logInfo != nil {
 				logInfo.Printf("MTProto CF domain cooldown domain=%s reason=%s until=%s",
 					baseDomain, kind, formatCooldownUntil(health.CooldownUntil))
@@ -255,7 +247,7 @@ func (c *mtProtoCFProxyConnector) Connect(
 			ws.Close()
 			lastErr = err
 			lastReason = "packet_splitter_failed"
-			cfPool.MarkFailure(baseDomain, tgwsroute.CFFailureWebSocket, 0)
+			cfPool.MarkFailure(wsDC, baseDomain, tgwsroute.CFFailureWebSocket, 0)
 			continue
 		}
 
@@ -306,14 +298,36 @@ func defaultMtProtoCFProxyDial(domain, path, logPrefix string) (mtProtoFrameSock
 }
 
 func mtProtoWebSocketConn(ws mtProtoFrameSocket, relayInit []byte, remote string) (net.Conn, error) {
+	return mtProtoWebSocketConnWithFraming(ws, relayInit, remote, true)
+}
+
+// mtProtoWorkerWebSocketConn mirrors Flowseal's cf_worker fallback semantics:
+// relay_init is sent first, then each transformed TCP chunk is forwarded as one
+// WebSocket message without MTProto packet-aware splitting.
+func mtProtoWorkerWebSocketConn(ws mtProtoFrameSocket, relayInit []byte, remote string) (net.Conn, error) {
+	return mtProtoWebSocketConnWithFraming(ws, relayInit, remote, false)
+}
+
+func mtProtoWebSocketConnWithFraming(
+	ws mtProtoFrameSocket,
+	relayInit []byte,
+	remote string,
+	splitOutboundPackets bool,
+) (net.Conn, error) {
 	ws = wrapMtProtoFrameSocket(ws)
 	if err := ws.Send(relayInit); err != nil {
 		return nil, fmt.Errorf("write relay init to WebSocket %s: %w", remote, err)
 	}
-	splitter, err := newMsgSplitter(relayInit)
-	if err != nil {
-		return nil, fmt.Errorf("create packet splitter for WebSocket %s: %w", remote, err)
+
+	var splitter *MsgSplitter
+	if splitOutboundPackets {
+		var err error
+		splitter, err = newMsgSplitter(relayInit)
+		if err != nil {
+			return nil, fmt.Errorf("create packet splitter for WebSocket %s: %w", remote, err)
+		}
 	}
+
 	return &mtProtoWebSocketStream{
 		socket:   ws,
 		splitter: splitter,
