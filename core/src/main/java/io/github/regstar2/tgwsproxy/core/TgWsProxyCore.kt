@@ -1,5 +1,7 @@
 package io.github.regstar2.tgwsproxy.core
 
+import org.json.JSONObject
+
 private val rawSecretPattern = Regex("^[0-9a-fA-F]{32}$")
 
 data class TgWsProxyConfig(
@@ -75,6 +77,41 @@ data class TgWsProxyOperationResult(
     val status: TgWsProxyStatus? = null,
 )
 
+data class TgWsProxyActionResult(
+    val success: Boolean,
+    val code: String = "",
+)
+
+data class TgWsProxyWireGuardKeyPair(
+    val success: Boolean,
+    val privateKey: String = "",
+    val publicKey: String = "",
+    val code: String = "",
+)
+
+data class TgWsProxyAwgProbeResult(
+    val success: Boolean,
+    val code: String,
+    val endpoint: String = "",
+    val lastHandshakeUnix: Long = 0,
+    val tunnelTxBytes: Long = 0,
+    val tunnelRxBytes: Long = 0,
+)
+
+data class TgWsProxyConsumerWarpHttpResult(
+    val success: Boolean,
+    val code: String,
+    val status: Int = 0,
+    val body: String = "",
+    val requestSent: Boolean = false,
+)
+
+data class TgWsProxyWorkerHealthResult(
+    val success: Boolean,
+    val code: String,
+    val status: Int = 0,
+)
+
 object TgWsProxyCore {
     @Synchronized
     fun start(config: TgWsProxyConfig): TgWsProxyOperationResult {
@@ -125,6 +162,129 @@ object TgWsProxyCore {
         parseStatusFields(NativeBridge.proxyStatus())
     } catch (_: Throwable) {
         emptyMap()
+    }
+
+    fun configureAwgWarp(
+        configPath: String,
+        enabled: Boolean = true,
+        preferred: Boolean = false,
+        allowFallback: Boolean = true,
+    ): TgWsProxyActionResult = try {
+        val code = NativeBridge.configureAwgWarp(configPath.trim(), enabled, preferred, allowFallback)
+        TgWsProxyActionResult(code == 0, if (code == 0) "ok" else "awg_configure_failed")
+    } catch (_: Throwable) {
+        TgWsProxyActionResult(false, "native_unavailable")
+    }
+
+    fun resetAwgWarp(): TgWsProxyActionResult = try {
+        val code = NativeBridge.resetAwgWarp()
+        TgWsProxyActionResult(code == 0, if (code == 0) "ok" else "awg_reset_failed")
+    } catch (_: Throwable) {
+        TgWsProxyActionResult(false, "native_unavailable")
+    }
+
+    fun generateWireGuardKeyPair(): TgWsProxyWireGuardKeyPair = try {
+        val json = JSONObject(NativeBridge.generateWireGuardKeyPairJson())
+        TgWsProxyWireGuardKeyPair(
+            success = json.optBoolean("ok", false),
+            privateKey = json.optString("private_key", ""),
+            publicKey = json.optString("public_key", ""),
+            code = if (json.optBoolean("ok", false)) "ok" else json.optString("code", "key_generation_failed"),
+        )
+    } catch (_: Throwable) {
+        TgWsProxyWireGuardKeyPair(false, code = "native_unavailable")
+    }
+
+    fun validateAwgWarpConfig(configPath: String): Boolean = try {
+        NativeBridge.validateAwgWarpConfig(configPath.trim()) == 0
+    } catch (_: Throwable) {
+        false
+    }
+
+    fun probeAwgWarpConfig(
+        configPath: String,
+        target: String = "149.154.175.50:443",
+        timeoutMillis: Long = 15_000L,
+    ): TgWsProxyAwgProbeResult = try {
+        val json = JSONObject(NativeBridge.probeAwgWarpConfigJson(configPath.trim(), target.trim(), timeoutMillis))
+        TgWsProxyAwgProbeResult(
+            success = json.optBoolean("ok", false),
+            code = json.optString("code", "probe_failed"),
+            endpoint = json.optString("endpoint", ""),
+            lastHandshakeUnix = json.optLong("last_handshake_unix", 0L),
+            tunnelTxBytes = json.optLong("tunnel_tx_bytes", 0L),
+            tunnelRxBytes = json.optLong("tunnel_rx_bytes", 0L),
+        )
+    } catch (_: Throwable) {
+        TgWsProxyAwgProbeResult(false, "native_unavailable")
+    }
+
+    fun registerConsumerWarpDirect(
+        publicKey: String,
+        timeoutMillis: Long = 20_000L,
+    ): TgWsProxyConsumerWarpHttpResult =
+        parseConsumerWarpHttpResultSafely {
+            NativeBridge.registerConsumerWarpDirectJson(publicKey.trim(), timeoutMillis)
+        }
+
+    fun activateConsumerWarpDirect(
+        registrationID: String,
+        token: String,
+        timeoutMillis: Long = 20_000L,
+    ): TgWsProxyConsumerWarpHttpResult =
+        parseConsumerWarpHttpResultSafely {
+            NativeBridge.activateConsumerWarpDirectJson(registrationID.trim(), token.trim(), timeoutMillis)
+        }
+
+    fun checkConsumerWarpWorker(
+        workerHostname: String,
+        timeoutMillis: Long = 5_000L,
+    ): TgWsProxyWorkerHealthResult = try {
+        val json = JSONObject(NativeBridge.checkConsumerWarpWorkerJson(workerHostname.trim(), timeoutMillis))
+        TgWsProxyWorkerHealthResult(
+            success = json.optBoolean("ok", false),
+            code = json.optString("code", "health_failed"),
+            status = json.optInt("status", 0),
+        )
+    } catch (_: Throwable) {
+        TgWsProxyWorkerHealthResult(false, "native_unavailable")
+    }
+
+    fun registerConsumerWarpWithWorker(
+        workerHostname: String,
+        publicKey: String,
+        timeoutMillis: Long = 20_000L,
+    ): TgWsProxyConsumerWarpHttpResult =
+        parseConsumerWarpHttpResultSafely {
+            NativeBridge.registerConsumerWarpWithWorkerJson(workerHostname.trim(), publicKey.trim(), timeoutMillis)
+        }
+
+    fun activateConsumerWarpWithWorker(
+        workerHostname: String,
+        registrationID: String,
+        token: String,
+        timeoutMillis: Long = 20_000L,
+    ): TgWsProxyConsumerWarpHttpResult =
+        parseConsumerWarpHttpResultSafely {
+            NativeBridge.activateConsumerWarpWithWorkerJson(
+                workerHostname.trim(),
+                registrationID.trim(),
+                token.trim(),
+                timeoutMillis,
+            )
+        }
+
+    private fun parseConsumerWarpHttpResultSafely(block: () -> String): TgWsProxyConsumerWarpHttpResult = try {
+        val json = JSONObject(block())
+        TgWsProxyConsumerWarpHttpResult(
+            success = json.optBoolean("ok", false),
+            code = json.optString("code", "request_failed"),
+            status = json.optInt("status", 0),
+            body = json.optString("body", ""),
+            requestSent = json.optBoolean("request_sent", false),
+        )
+    } catch (_: Throwable) {
+        TgWsProxyConsumerWarpHttpResult(false, "native_unavailable")
     }
 
     private fun nativeUnavailable(error: Throwable) = TgWsProxyOperationResult(
