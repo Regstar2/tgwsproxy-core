@@ -150,13 +150,52 @@ func (c *mtProtoRouteConnector) connectorForRoute(route routeKind) mtproxyfronte
 	}
 }
 
+func explicitMtProtoRoutes(settings runtimeSettings) []routeKind {
+	if len(settings.ExplicitRouteOrder) == 0 {
+		return nil
+	}
+
+	awgReady := globalAWGWarpRouteRuntime.Policy().Enabled
+	out := make([]routeKind, 0, len(settings.ExplicitRouteOrder))
+	for _, route := range settings.ExplicitRouteOrder {
+		if settings.PolicyPresent && !isRouteAllowedByPolicy(settings, route) {
+			continue
+		}
+		switch route {
+		case routeDirectWS:
+			out = append(out, route)
+		case routeCFProxyWS:
+			if settings.CF.Enabled {
+				out = append(out, route)
+			}
+		case routeAWGWarp:
+			if awgReady {
+				out = append(out, route)
+			}
+		case routeCFWorkerWS:
+			if settings.Worker.Enabled && settings.Worker.Domain != "" {
+				out = append(out, route)
+			}
+		case routeTCPFallback:
+			out = append(out, route)
+		}
+	}
+	return out
+}
+
 func mtProtoRoutesForCapability(settings runtimeSettings) []routeKind {
+	if len(settings.ExplicitRouteOrder) > 0 {
+		return explicitMtProtoRoutes(settings)
+	}
 	return withAWGWarpRoute(routesForMode(settings.Mode, settings, false))
 }
 
 func mtProtoRoutesForRequest(settings runtimeSettings, request mtproxyfrontend.OutboundRequest) []routeKind {
 	if request.IsTestDC {
 		return mtProtoTestDCRoutes(settings)
+	}
+	if len(settings.ExplicitRouteOrder) > 0 {
+		return explicitMtProtoRoutes(settings)
 	}
 	if settings.Mode == modeAuto {
 		return withAWGWarpRoute(adaptiveRoutesForMode(settings.Mode, settings, false, request.DCID, request.IsMedia))

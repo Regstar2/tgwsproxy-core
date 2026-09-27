@@ -733,3 +733,69 @@ func withMtProtoWorkerDCMap(t *testing.T, value map[int]string) {
 		dcOptMu.Unlock()
 	})
 }
+
+
+func TestExplicitWiFiRouteOrderIsStableAndSkipsNoConfiguredRoute(t *testing.T) {
+	globalAWGWarpRouteRuntime.mu.Lock()
+	previousPolicy := globalAWGWarpRouteRuntime.policy
+	globalAWGWarpRouteRuntime.policy = awgWarpRoutePolicy{Enabled: true}
+	globalAWGWarpRouteRuntime.mu.Unlock()
+	t.Cleanup(func() {
+		globalAWGWarpRouteRuntime.mu.Lock()
+		globalAWGWarpRouteRuntime.policy = previousPolicy
+		globalAWGWarpRouteRuntime.mu.Unlock()
+	})
+
+	settings := runtimeSettings{
+		Mode: modeAuto,
+		CF: cfProxyConfig{Enabled: true},
+		Worker: workerConfig{Enabled: true, Domain: "proxy.workers.dev"},
+		PolicyPresent: true,
+		AllowDirect: true,
+		AllowCFProxy: true,
+		AllowAWG: true,
+		AllowWorker: true,
+		AllowTCP: false,
+		ExplicitRouteOrder: []routeKind{
+			routeDirectWS,
+			routeCFProxyWS,
+			routeAWGWarp,
+			routeCFWorkerWS,
+		},
+	}
+
+	got := mtProtoRoutesForRequest(settings, mtproxyfrontend.OutboundRequest{DCID: 2})
+	want := []routeKind{routeDirectWS, routeCFProxyWS, routeAWGWarp, routeCFWorkerWS}
+	if len(got) != len(want) {
+		t.Fatalf("routes=%v, want=%v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("routes=%v, want=%v", got, want)
+		}
+	}
+}
+
+func TestExplicitMobileRouteOrderSkipsUnavailableOptionalRoutes(t *testing.T) {
+	settings := runtimeSettings{
+		Mode: modeAuto,
+		CF: cfProxyConfig{Enabled: true},
+		Worker: workerConfig{Enabled: false},
+		PolicyPresent: true,
+		AllowDirect: false,
+		AllowCFProxy: true,
+		AllowAWG: true,
+		AllowWorker: true,
+		AllowTCP: false,
+		ExplicitRouteOrder: []routeKind{
+			routeCFProxyWS,
+			routeAWGWarp,
+			routeCFWorkerWS,
+		},
+	}
+
+	got := mtProtoRoutesForRequest(settings, mtproxyfrontend.OutboundRequest{DCID: 2})
+	if len(got) != 1 || got[0] != routeCFProxyWS {
+		t.Fatalf("routes=%v, want=[%s]", got, routeCFProxyWS)
+	}
+}

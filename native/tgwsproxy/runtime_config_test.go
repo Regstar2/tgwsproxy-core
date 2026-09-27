@@ -45,3 +45,42 @@ func TestParseRuntimeConfigDecodesFlowsealCachedCFDomains(t *testing.T) {
 		t.Fatalf("cached upstream=%v, want first %s", settings.CFCachedUpstream, wantFirst)
 	}
 }
+
+
+func TestParseRuntimeConfigPreservesExplicitRouteOrderIncludingAWG(t *testing.T) {
+	_, settings, err := parseRuntimeConfig(
+		"@connection_mode=auto,@route_direct_ws=1,@route_cf_proxy_ws=1,@route_awg_warp=1,@route_worker_ws=1,@route_tcp_fallback=0,@route_order=direct_ws|cf_proxy_ws|awg_warp|cf_worker_ws",
+	)
+	if err != nil {
+		t.Fatalf("parseRuntimeConfig: %v", err)
+	}
+
+	want := []routeKind{routeDirectWS, routeCFProxyWS, routeAWGWarp, routeCFWorkerWS}
+	if len(settings.ExplicitRouteOrder) != len(want) {
+		t.Fatalf("route order=%v, want=%v", settings.ExplicitRouteOrder, want)
+	}
+	for i := range want {
+		if settings.ExplicitRouteOrder[i] != want[i] {
+			t.Fatalf("route order=%v, want=%v", settings.ExplicitRouteOrder, want)
+		}
+	}
+	if !settings.AllowAWG {
+		t.Fatal("route_awg_warp was not enabled")
+	}
+	if settings.AllowTCP {
+		t.Fatal("route_tcp_fallback should be disabled")
+	}
+}
+
+func TestParseRouteOrderDropsUnknownAndDuplicateRoutes(t *testing.T) {
+	got := parseRouteOrder("direct_ws|unknown|cf_proxy_ws|direct_ws|awg")
+	want := []routeKind{routeDirectWS, routeCFProxyWS, routeAWGWarp}
+	if len(got) != len(want) {
+		t.Fatalf("route order=%v, want=%v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("route order=%v, want=%v", got, want)
+		}
+	}
+}

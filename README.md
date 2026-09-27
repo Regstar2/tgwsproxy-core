@@ -22,6 +22,8 @@ Native runtime синхронизирован с `Regstar2/tg-ws-proxy-android` 
 - локальный MTProto frontend;
 - Cloudflare Proxy, Direct WebSocket и Cloudflare Worker routes;
 - AWG/WARP userspace runtime из v1.11.0;
+- explicit ordered route policy для host-приложений, которым нужен детерминированный fallback chain;
+- reusable AWG/WARP config/probe и ограниченные Consumer WARP registration/bootstrap operations;
 - актуальные route health/cooldown, Worker failover и WebSocket transport improvements;
 - минимальный Kotlin API;
 - сборка `libtgwsproxy.so` из включённого Go source;
@@ -69,7 +71,10 @@ if (result.success) {
 - `TgWsProxyCore.start(config)`;
 - `TgWsProxyCore.stop()`;
 - `TgWsProxyCore.status()`;
-- `TgWsProxyCore.transportStatus()`.
+- `TgWsProxyCore.transportStatus()`;
+- `TgWsProxyCore.configureAwgWarp(...) / resetAwgWarp()`;
+- `TgWsProxyCore.generateWireGuardKeyPair() / validateAwgWarpConfig(...) / probeAwgWarpConfig(...)`;
+- restricted Consumer WARP direct/bootstrap Worker operations for profile provisioning.
 
 ## Архитектура
 
