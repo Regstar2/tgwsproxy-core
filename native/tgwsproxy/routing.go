@@ -60,6 +60,7 @@ type runtimeSettings struct {
 	NetworkProfileLabel       string
 	AdaptiveRouteStats        string
 	AutoStrategy              string
+	ExplicitRouteOrder        []routeKind
 	MtProtoFakeTLSDomain      string
 	MtProtoMaskingPassthrough bool
 	MtProtoWorkerPreconnect   bool
@@ -69,6 +70,7 @@ type runtimeSettings struct {
 	AllowDirect   bool
 	AllowWorker   bool
 	AllowCFProxy  bool
+	AllowAWG      bool
 	AllowTCP      bool
 	Preferred     routeKind // empty means "no explicit preferred"
 	AllowFallback bool
@@ -126,6 +128,8 @@ func parsePreferredRoute(raw string) routeKind {
 		return routeCFWorkerWS
 	case "cf_proxy_ws", "cf":
 		return routeCFProxyWS
+	case "awg_warp", "awg", "warp":
+		return routeAWGWarp
 	case "tcp_fallback", "tcp":
 		return routeTCPFallback
 	default:
@@ -133,11 +137,29 @@ func parsePreferredRoute(raw string) routeKind {
 	}
 }
 
+func parseRouteOrder(raw string) []routeKind {
+	parts := strings.Split(raw, "|")
+	out := make([]routeKind, 0, len(parts))
+	seen := make(map[routeKind]struct{}, len(parts))
+	for _, part := range parts {
+		route := parsePreferredRoute(part)
+		if route == "" {
+			continue
+		}
+		if _, exists := seen[route]; exists {
+			continue
+		}
+		seen[route] = struct{}{}
+		out = append(out, route)
+	}
+	return out
+}
+
 func allowedRoutesList(s runtimeSettings) []routeKind {
 	if !s.PolicyPresent {
 		return nil
 	}
-	out := make([]routeKind, 0, 4)
+	out := make([]routeKind, 0, 5)
 	if s.AllowDirect {
 		out = append(out, routeDirectWS)
 	}
@@ -146,6 +168,9 @@ func allowedRoutesList(s runtimeSettings) []routeKind {
 	}
 	if s.AllowCFProxy {
 		out = append(out, routeCFProxyWS)
+	}
+	if s.AllowAWG {
+		out = append(out, routeAWGWarp)
 	}
 	if s.AllowTCP {
 		out = append(out, routeTCPFallback)
@@ -302,6 +327,8 @@ func isRouteAllowedByPolicy(settings runtimeSettings, r routeKind) bool {
 		return settings.AllowWorker
 	case routeCFProxyWS:
 		return settings.AllowCFProxy
+	case routeAWGWarp:
+		return settings.AllowAWG
 	case routeTCPFallback:
 		return settings.AllowTCP
 	default:

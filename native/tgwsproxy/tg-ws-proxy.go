@@ -3133,6 +3133,11 @@ func parseRuntimeConfig(raw string) (map[int]string, runtimeSettings, error) {
 				settings.AdaptiveRouteStats = val
 			case "auto_strategy":
 				settings.AutoStrategy = val
+			case "route_order":
+				settings.ExplicitRouteOrder = parseRouteOrder(val)
+				if len(settings.ExplicitRouteOrder) > 0 {
+					settings.PolicyPresent = true
+				}
 			case "mtproto_fake_tls_domain", "fake_tls_domain":
 				settings.MtProtoFakeTLSDomain = mtproxyfrontend.NormalizeFakeTLSDomain(val)
 			case "mtproto_masking_passthrough", "fake_tls_masking_passthrough":
@@ -3150,6 +3155,9 @@ func parseRuntimeConfig(raw string) (map[int]string, runtimeSettings, error) {
 			case "route_cf_proxy_ws":
 				settings.PolicyPresent = true
 				settings.AllowCFProxy = parseBoolValue(val)
+			case "route_awg_warp":
+				settings.PolicyPresent = true
+				settings.AllowAWG = parseBoolValue(val)
 			case "route_tcp_fallback":
 				settings.PolicyPresent = true
 				settings.AllowTCP = parseBoolValue(val)
