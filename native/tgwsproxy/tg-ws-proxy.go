@@ -467,6 +467,10 @@ func directIPCooldownFallbackAvailable(settings runtimeSettings) bool {
 }
 
 func resolvePreferredIPs(domain string, timeout float64) (resolvedIPs, error) {
+	return resolvePreferredIPsContext(context.Background(), domain, timeout)
+}
+
+func resolvePreferredIPsContext(parent context.Context, domain string, timeout float64) (resolvedIPs, error) {
 	resolveTimeout := timeout
 	if resolveTimeout <= 0 {
 		resolveTimeout = 5
@@ -475,7 +479,7 @@ func resolvePreferredIPs(domain string, timeout float64) (resolvedIPs, error) {
 		resolveTimeout = 5
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(resolveTimeout*float64(time.Second)))
+	ctx, cancel := context.WithTimeout(parent, time.Duration(resolveTimeout*float64(time.Second)))
 	defer cancel()
 
 	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, domain)
@@ -706,6 +710,63 @@ type RawWebSocket struct {
 }
 
 func wsConnect(ip, domain, path string, timeout float64) (*RawWebSocket, error) {
+	return wsConnectWithCurves(ip, domain, path, timeout, nil)
+}
+
+type compatibleWebSocketTLSDialer struct {
+	defaultAttempted bool
+	ctx              context.Context
+	dial             func(ip, domain, path string, timeout float64, curves []tls.CurveID) (*RawWebSocket, error)
+}
+
+func (d *compatibleWebSocketTLSDialer) connect(ip, domain, path string, timeout float64) (*RawWebSocket, error) {
+	dial := d.dial
+	if dial == nil {
+		ctx := d.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		dial = func(ip, domain, path string, timeout float64, curves []tls.CurveID) (*RawWebSocket, error) {
+			return wsConnectWithCurvesContext(ctx, ip, domain, path, timeout, curves)
+		}
+	}
+	// Some networks drop the larger hybrid post-quantum ClientHello used by Go's defaults.
+	ws, err := dial(ip, domain, path, timeout, classicalTLSCurves())
+	var stageErr *wsStageError
+	if err == nil || d.defaultAttempted || !errors.As(err, &stageErr) || stageErr.Stage != "tls_handshake" || errors.Is(err, context.Canceled) || (d.ctx != nil && d.ctx.Err() != nil) {
+		return ws, err
+	}
+	d.defaultAttempted = true
+	if logDebug != nil {
+		logDebug.Printf("WebSocket TLS fallback profile=go_default reason=classical_handshake_failed")
+	}
+	fallback, fallbackErr := dial(ip, domain, path, timeout, nil)
+	if fallbackErr == nil {
+		return fallback, nil
+	}
+	// Preserve the original failure classification for cooldown and DNS fast-skip.
+	return nil, err
+}
+
+func classicalTLSCurves() []tls.CurveID { return []tls.CurveID{tls.X25519, tls.CurveP256} }
+
+func webSocketTLSConfig(domain string, curves []tls.CurveID) *tls.Config {
+	return &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         domain,
+		CurvePreferences:   curves,
+	}
+}
+
+func wsConnectWithCurves(ip, domain, path string, timeout float64, curves []tls.CurveID) (*RawWebSocket, error) {
+	return wsConnectWithCurvesContext(context.Background(), ip, domain, path, timeout, curves)
+}
+
+func wsConnectWithCurvesContext(ctx context.Context, ip, domain, path string, timeout float64, curves []tls.CurveID) (*RawWebSocket, error) {
+	return wsConnectWithCurvesContextDial(ctx, ip, domain, path, timeout, curves, nil)
+}
+
+func wsConnectWithCurvesContextDial(ctx context.Context, ip, domain, path string, timeout float64, curves []tls.CurveID, dialContext func(context.Context, string, string) (net.Conn, error)) (*RawWebSocket, error) {
 	if path == "" {
 		path = "/apiws"
 	}
@@ -722,20 +783,22 @@ func wsConnect(ip, domain, path string, timeout float64) (*RawWebSocket, error) 
 		Timeout: time.Duration(dialTimeout * float64(time.Second)),
 	}
 
-	tlsCfg := &tls.Config{
-		InsecureSkipVerify: true,
-		ServerName:         domain,
-	}
+	tlsCfg := webSocketTLSConfig(domain, curves)
 
-	rawConn, err := dialer.Dial("tcp", joinAddr(ip, 443))
+	if dialContext == nil {
+		dialContext = dialer.DialContext
+	}
+	rawConn, err := dialContext(ctx, "tcp", joinAddr(ip, 443))
 	if err != nil {
 		return nil, &wsStageError{Stage: "tcp_dial", Err: err}
 	}
 	setSockOpts(rawConn)
+	stopCancel := context.AfterFunc(ctx, func() { _ = rawConn.Close() })
+	defer stopCancel()
 
 	tlsConn := tls.Client(rawConn, tlsCfg)
 	_ = tlsConn.SetDeadline(time.Now().Add(time.Duration(timeout * float64(time.Second))))
-	if err := tlsConn.Handshake(); err != nil {
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		_ = tlsConn.Close()
 		return nil, &wsStageError{Stage: "tls_handshake", Err: err}
 	}
@@ -805,6 +868,10 @@ func wsConnect(ip, domain, path string, timeout float64) (*RawWebSocket, error) 
 	}
 
 	if statusCode == 101 {
+		if err := ctx.Err(); err != nil {
+			_ = tlsConn.Close()
+			return nil, err
+		}
 		ws := &RawWebSocket{
 			conn:      tlsConn,
 			bufReader: bufReader,
@@ -1684,7 +1751,8 @@ type defaultWorkerPoolDialer struct{}
 
 func (defaultWorkerPoolDialer) DialWorker(key WorkerPoolKey) (*RawWebSocket, error) {
 	path := buildWorkerWSPath(key.DC, key.Dst, key.Media, "")
-	ws, err := wsConnect(key.WorkerDomain, key.WorkerDomain, path, 10)
+	dialer := compatibleWebSocketTLSDialer{}
+	ws, err := dialer.connect(key.WorkerDomain, key.WorkerDomain, path, 10)
 	if err == nil {
 		return ws, nil
 	}
@@ -1695,7 +1763,7 @@ func (defaultWorkerPoolDialer) DialWorker(key WorkerPoolKey) (*RawWebSocket, err
 	}
 	lastErr := err
 	for _, ip := range resolved.Preferred() {
-		ws, lastErr = wsConnect(ip, key.WorkerDomain, path, 10)
+		ws, lastErr = dialer.connect(ip, key.WorkerDomain, path, 10)
 		if lastErr == nil {
 			return ws, nil
 		}
@@ -2835,13 +2903,17 @@ func listenProxyTCP(ctx context.Context, addr string) (net.Listener, error) {
 	return listener, nil
 }
 
-func runProxy(ctx context.Context, host string, port int, dcOptMap map[int]string) error {
+func runProxy(ctx context.Context, host string, port int, dcOptMap map[int]string, started ...chan<- error) error {
 	dcOptMu.Lock()
 	dcOpt = dcOptMap
 	dcOptMu.Unlock()
 
 	addr := joinAddr(host, port)
 	listener, err := listenProxyTCP(ctx, addr)
+	if len(started) > 0 && started[0] != nil {
+		// Report the real bind result before Android marks the local proxy as running.
+		started[0] <- err
+	}
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", addr, err)
 	}
@@ -3084,6 +3156,8 @@ func parseRuntimeConfig(raw string) (map[int]string, runtimeSettings, error) {
 				}
 			case "worker_enabled":
 				settings.Worker.Enabled = parseBoolValue(val)
+			case "worker_transport":
+				settings.Worker.Transport = normalizeWorkerTransport(val)
 			case "worker_domain":
 				settings.Worker.Domain = NormalizeWorkerDomain(val)
 				if settings.Worker.Domain != "" && (!settings.PolicyPresent || settings.AllowWorker) {
@@ -3098,6 +3172,7 @@ func parseRuntimeConfig(raw string) (map[int]string, runtimeSettings, error) {
 					settings.Worker.Failover.MaxAttempts = n
 				}
 			case "worker_failover_candidates":
+				settings.Worker.Failover.CandidatesSpecified = true
 				settings.Worker.Failover.Candidates = parseWorkerFailoverCandidates(val)
 			case "worker_failover_skipped_backoff":
 				if n, err := strconv.Atoi(strings.TrimSpace(val)); err == nil && n >= 0 {
@@ -3320,11 +3395,18 @@ func StartProxy(cHost *C.char, port C.int, cDcIps *C.char, verbose C.int) C.int 
 
 	globalCtx, globalCancel = context.WithCancel(context.Background())
 
+	started := make(chan error, 1)
 	go func() {
-		if err := runProxy(globalCtx, host, goPort, dcOptMap); err != nil {
+		if err := runProxy(globalCtx, host, goPort, dcOptMap, started); err != nil {
 			logError.Printf("runProxy error: %v", err)
 		}
 	}()
+	if err := <-started; err != nil {
+		globalCancel()
+		globalCancel = nil
+		globalCtx = nil
+		return -3
+	}
 
 	return 0
 }

@@ -9,7 +9,7 @@
 
 ## О проекте
 
-Native runtime синхронизирован с `Regstar2/tg-ws-proxy-android` commit `c5c4d03ce6f731642cfd5d66d0bdc56377606831` (v1.11.0). Исходный Android-репозиторий при синхронизации не изменяется.
+Native runtime синхронизирован с `Regstar2/tg-ws-proxy-android` commit `baf61c29e345a604d3915dbcec516cca5bb9a2fc` (v1.11.6). Исходный Android-репозиторий при синхронизации не изменяется.
 
 ## Статус проекта
 
@@ -24,7 +24,7 @@ Native runtime синхронизирован с `Regstar2/tg-ws-proxy-android` 
 - AWG/WARP userspace runtime из v1.11.0;
 - explicit ordered route policy для host-приложений, которым нужен детерминированный fallback chain;
 - reusable AWG/WARP config/probe и ограниченные Consumer WARP registration/bootstrap operations;
-- актуальные route health/cooldown, Worker failover и WebSocket transport improvements;
+- актуальные route health/cooldown, CF pool exhaustion handling, MTProto lifecycle cancellation, Worker transport/failover и WebSocket transport improvements;
 - минимальный Kotlin API;
 - сборка `libtgwsproxy.so` из включённого Go source;
 - без Compose, Activity, Service и Telegram classes.

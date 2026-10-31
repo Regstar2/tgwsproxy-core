@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
+	"time"
 
 	"tg-ws-proxy/mtproxyfrontend"
 	"tg-ws-proxy/tgwsroute"
@@ -41,7 +43,7 @@ func (c *mtProtoDirectWSConnector) Capability() mtproxyfrontend.OutboundCapabili
 }
 
 func (c *mtProtoDirectWSConnector) Connect(
-	_ context.Context,
+	ctx context.Context,
 	request mtproxyfrontend.OutboundRequest,
 ) (net.Conn, mtproxyfrontend.OutboundResult) {
 	result := mtproxyfrontend.OutboundResult{
@@ -86,6 +88,7 @@ func (c *mtProtoDirectWSConnector) Connect(
 	for _, domain := range domains {
 		prefix := fmt.Sprintf("[MTProto] DC%d%s direct_ws", request.DCID, mediaTag(request.IsMedia))
 		logMtProtoRouteAttempt(
+			ctx,
 			request,
 			routeDirectWS,
 			"target=%s domain=%s",
@@ -149,12 +152,36 @@ func defaultMtProtoDirectWSDial(targetIP, domain, path string, timeout float64) 
 }
 
 type mtProtoCFProxyConnector struct {
-	dial mtProtoRouteDial
+	dial        mtProtoRouteDial
+	dialContext func(context.Context, string, string, string) (mtProtoFrameSocket, error)
+}
+
+type cfPoolMissWindow struct {
+	started time.Time
+	count   int64
+}
+
+var cfPoolMissSamples = struct {
+	sync.Mutex
+	byDC map[int]cfPoolMissWindow
+}{byDC: make(map[int]cfPoolMissWindow)}
+
+func countCFPoolMiss(dc int, now time.Time) int64 {
+	stats.cfPoolMisses.Add(1)
+	cfPoolMissSamples.Lock()
+	defer cfPoolMissSamples.Unlock()
+	window := cfPoolMissSamples.byDC[dc]
+	if window.started.IsZero() || now.Sub(window.started) >= 30*time.Second || now.Before(window.started) {
+		window = cfPoolMissWindow{started: now}
+	}
+	window.count++
+	cfPoolMissSamples.byDC[dc] = window
+	return window.count
 }
 
 func newMtProtoCFProxyConnector() *mtProtoCFProxyConnector {
 	return &mtProtoCFProxyConnector{
-		dial: defaultMtProtoCFProxyDial,
+		dialContext: defaultMtProtoCFProxyDial,
 	}
 }
 
@@ -166,11 +193,16 @@ func (c *mtProtoCFProxyConnector) Capability() mtproxyfrontend.OutboundCapabilit
 }
 
 func (c *mtProtoCFProxyConnector) Connect(
-	_ context.Context,
+	ctx context.Context,
 	request mtproxyfrontend.OutboundRequest,
 ) (net.Conn, mtproxyfrontend.OutboundResult) {
 	result := mtproxyfrontend.OutboundResult{
 		SelectedBackend: mtProtoCFProxyBackend,
+	}
+	if err := ctx.Err(); err != nil {
+		result.Reason = "cancelled"
+		result.Err = err
+		return nil, result
 	}
 
 	if request.IsTestDC {
@@ -194,17 +226,23 @@ func (c *mtProtoCFProxyConnector) Connect(
 	wsDC := effectiveWSHostDC(request.DCID)
 	selection := cfPool.SelectionForDC(wsDC)
 	if len(selection.Candidates) == 0 {
-		stats.cfPoolMisses.Add(1)
+		result.CFPoolMissCount = countCFPoolMiss(wsDC, time.Now())
 		result.Reason = "cfproxy_unavailable"
-		result.Err = fmt.Errorf("CF proxy pool has no available domains")
+		result.Err = cfPoolUnavailableError(wsDC, selection)
 		return nil, result
 	}
 	stats.cfPoolHits.Add(1)
 
 	var lastErr error
 	var lastReason string
+	attempted := false
 	skipCachedUpstream := false
 	for _, candidate := range selection.Candidates {
+		if err := ctx.Err(); err != nil {
+			result.Reason = "cancelled"
+			result.Err = err
+			return nil, result
+		}
 		if skipCachedUpstream && candidate.Source == tgwsroute.CFDomainSourceCachedUpstream {
 			if logDebug != nil {
 				logDebug.Printf("MTProto CF cached upstream skipped domain=%s reason=previous_dns_failure", candidate.Domain)
@@ -212,9 +250,20 @@ func (c *mtProtoCFProxyConnector) Connect(
 			continue
 		}
 		baseDomain := candidate.Domain
+		if !cfPool.TryReserve(wsDC, baseDomain) {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			cfPool.ReleaseReservation(wsDC, baseDomain)
+			result.Reason = "cancelled"
+			result.Err = err
+			return nil, result
+		}
+		attempted = true
 		host := cfProxyHost(wsDC, baseDomain)
 		prefix := fmt.Sprintf("[MTProto] DC%d%s cfproxy", request.DCID, mediaTag(request.IsMedia))
 		logMtProtoRouteAttempt(
+			ctx,
 			request,
 			routeCFProxyWS,
 			"host=%s pool_domain=%s source=%s",
@@ -223,7 +272,22 @@ func (c *mtProtoCFProxyConnector) Connect(
 			candidate.Source,
 		)
 
-		ws, err := c.dial(host, "/apiws", prefix)
+		var ws mtProtoFrameSocket
+		var err error
+		if c.dialContext != nil {
+			ws, err = c.dialContext(ctx, host, "/apiws", prefix)
+		} else {
+			ws, err = c.dial(host, "/apiws", prefix)
+		}
+		if cancelled := ctx.Err(); cancelled != nil {
+			if ws != nil {
+				ws.Close()
+			}
+			cfPool.ReleaseReservation(wsDC, baseDomain)
+			result.Reason = "cancelled"
+			result.Err = cancelled
+			return nil, result
+		}
 		if err != nil {
 			lastErr = err
 			kind := classifyCFFailure(err)
@@ -242,7 +306,16 @@ func (c *mtProtoCFProxyConnector) Connect(
 			continue
 		}
 
+		stopCancel := context.AfterFunc(ctx, ws.Close)
 		stream, err := mtProtoWebSocketConn(ws, request.RelayInit, host)
+		stopCancel()
+		if cancelled := ctx.Err(); cancelled != nil {
+			ws.Close()
+			cfPool.ReleaseReservation(wsDC, baseDomain)
+			result.Reason = "cancelled"
+			result.Err = cancelled
+			return nil, result
+		}
 		if err != nil {
 			ws.Close()
 			lastErr = err
@@ -252,6 +325,7 @@ func (c *mtProtoCFProxyConnector) Connect(
 		}
 
 		cfPool.MarkSuccess(wsDC, baseDomain, 0)
+		cfPool.ReleaseReservation(wsDC, baseDomain)
 		stats.connectionsCfProxy.Add(1)
 		result.ActualBackend = mtProtoCFProxyBackend
 		result.Reason = "connected"
@@ -259,6 +333,12 @@ func (c *mtProtoCFProxyConnector) Connect(
 	}
 
 	stats.cfPoolRefillErrors.Add(1)
+	if !attempted {
+		result.CFPoolMissCount = countCFPoolMiss(wsDC, time.Now())
+		result.Reason = "cfproxy_unavailable"
+		result.Err = cfPoolUnavailableError(wsDC, cfPool.AvailabilityForDC(wsDC))
+		return nil, result
+	}
 	if lastReason == "" {
 		lastReason = "cfproxy_all_domains_failed"
 	}
@@ -270,23 +350,41 @@ func (c *mtProtoCFProxyConnector) Connect(
 	return nil, result
 }
 
-func defaultMtProtoCFProxyDial(domain, path, logPrefix string) (mtProtoFrameSocket, error) {
-	ws, err := wsConnect(domain, domain, path, 10)
+func cfPoolUnavailableError(dc int, selection tgwsroute.CFDomainSelection) error {
+	return fmt.Errorf("CF proxy pool unavailable dc=%d eligible=%d cooldown=%d in_flight=%d retry_after_seconds=%.1f",
+		dc, len(selection.Candidates), len(selection.SkippedCooldown), len(selection.SkippedInFlight), selection.RetryAfterSeconds)
+}
+
+func defaultMtProtoCFProxyDial(ctx context.Context, domain, path, logPrefix string) (mtProtoFrameSocket, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	dialer := compatibleWebSocketTLSDialer{ctx: ctx}
+	ws, err := dialer.connect(domain, domain, path, 10)
 	if err == nil {
 		return ws, nil
 	}
+	if cancelled := ctx.Err(); cancelled != nil {
+		return nil, cancelled
+	}
 	logDomainConnectFailure(logPrefix, domain, domain, err)
 
-	resolved, resolveErr := resolvePreferredIPs(domain, 10)
+	resolved, resolveErr := resolvePreferredIPsContext(ctx, domain, 10)
 	if resolveErr != nil {
 		return nil, err
 	}
 
 	lastErr := err
 	for _, ip := range resolved.Preferred() {
-		ws, lastErr = wsConnect(ip, domain, path, 10)
+		if cancelled := ctx.Err(); cancelled != nil {
+			return nil, cancelled
+		}
+		ws, lastErr = dialer.connect(ip, domain, path, 10)
 		if lastErr == nil {
 			return ws, nil
+		}
+		if cancelled := ctx.Err(); cancelled != nil {
+			return nil, cancelled
 		}
 		logDomainConnectFailure(logPrefix, domain, ip, lastErr)
 		var wsErr *WsHandshakeError
@@ -301,11 +399,17 @@ func mtProtoWebSocketConn(ws mtProtoFrameSocket, relayInit []byte, remote string
 	return mtProtoWebSocketConnWithFraming(ws, relayInit, remote, true)
 }
 
-// mtProtoWorkerWebSocketConn mirrors Flowseal's cf_worker fallback semantics:
-// relay_init is sent first, then each transformed TCP chunk is forwarded as one
-// WebSocket message without MTProto packet-aware splitting.
+// Chunk Relay preserves its existing TCP-read WebSocket message framing.
+// This is deliberately separate from the packet-aware Legacy Worker path.
 func mtProtoWorkerWebSocketConn(ws mtProtoFrameSocket, relayInit []byte, remote string) (net.Conn, error) {
 	return mtProtoWebSocketConnWithFraming(ws, relayInit, remote, false)
+}
+
+// Flowseal's Legacy /apiws bridge uses MsgSplitter for Worker fallback:
+// assemble complete MTProto transport packets before emitting WS messages.
+// Never apply this framing to the production Chunk Relay transport.
+func mtProtoLegacyWorkerWebSocketConn(ws mtProtoFrameSocket, relayInit []byte, remote string) (net.Conn, error) {
+	return mtProtoWebSocketConnWithFraming(ws, relayInit, remote, true)
 }
 
 func mtProtoWebSocketConnWithFraming(
