@@ -62,10 +62,23 @@ func (c *mtProtoRouteConnector) Connect(
 	ctx context.Context,
 	request mtproxyfrontend.OutboundRequest,
 ) (net.Conn, mtproxyfrontend.OutboundResult) {
-	routes := mtProtoRoutesForRequest(getRuntimeSettings(), request)
+	settings := getRuntimeSettings()
+	routes := mtProtoRoutesForRequest(settings, request)
+	ctx = context.WithValue(ctx, mtProtoRouteDecisionKey{}, mtProtoRouteDecision{
+		Routes: routes,
+		Generation: settings.PolicyGen,
+	})
+	if err := ctx.Err(); err != nil {
+		return nil, mtproxyfrontend.OutboundResult{
+			RouteGeneration: settings.PolicyGen,
+			Reason: "cancelled",
+			Err: err,
+		}
+	}
 	if len(routes) == 0 {
 		return nil, mtproxyfrontend.OutboundResult{
 			SelectedBackend: "",
+			RouteGeneration: settings.PolicyGen,
 			Reason:          "no_mtproto_route_available",
 			Err:             fmt.Errorf("no MTProto route available"),
 		}
@@ -77,6 +90,14 @@ func (c *mtProtoRouteConnector) Connect(
 	attempts := 0
 
 	for _, route := range routes {
+		if err := ctx.Err(); err != nil {
+			return nil, mtproxyfrontend.OutboundResult{
+				SelectedBackend: selectedBackend,
+				RouteGeneration: settings.PolicyGen,
+				Reason: "cancelled",
+				Err: err,
+			}
+		}
 		connector := c.connectorForRoute(route)
 		if connector == nil {
 			lastErr = fmt.Errorf("MTProto route %s is unsupported", route)
@@ -91,12 +112,22 @@ func (c *mtProtoRouteConnector) Connect(
 		attemptBackend := mtProtoBackendForRoute(route)
 		fallbackUsed := attempts > 0
 		if fallbackUsed && logInfo != nil {
-			logInfo.Printf("MTProto fallback activated selected_backend=%s attempt_backend=%s previous_reason=%s",
-				selectedBackend, attemptBackend, mtProtoStatusField(lastResult.Reason))
+			logInfo.Printf("MTProto fallback activated route_generation=%d selected_backend=%s attempt_backend=%s previous_reason=%s",
+				settings.PolicyGen, selectedBackend, attemptBackend, mtProtoStatusField(lastResult.Reason))
 		}
 		attempts++
 
 		conn, result := connector.Connect(ctx, request)
+		if err := ctx.Err(); err != nil {
+			if conn != nil { _ = conn.Close() }
+			return nil, mtproxyfrontend.OutboundResult{
+				SelectedBackend: selectedBackend,
+				RouteGeneration: settings.PolicyGen,
+				Reason: "cancelled",
+				Err: err,
+			}
+		}
+		result.RouteGeneration = settings.PolicyGen
 		result.SelectedBackend = selectedBackend
 		result.FallbackUsed = fallbackUsed
 		if result.ActualBackend == "" && conn != nil && result.Err == nil {
@@ -114,9 +145,9 @@ func (c *mtProtoRouteConnector) Connect(
 		if lastErr == nil {
 			lastErr = fmt.Errorf("MTProto route %s failed: %s", route, result.Reason)
 		}
-		if logInfo != nil {
-			logInfo.Printf("MTProto route candidate failed route=%s selected_backend=%s attempt_backend=%s fallback_used=%t reason=%s error=%v",
-				route, selectedBackend, attemptBackend, fallbackUsed, mtProtoStatusField(lastResult.Reason), lastErr)
+		if logInfo != nil && (result.Reason != "cfproxy_unavailable" || mtproxyfrontend.LogCFPoolMiss(result.CFPoolMissCount)) {
+			logInfo.Printf("MTProto route candidate failed route_generation=%d route=%s selected_backend=%s attempt_backend=%s fallback_used=%t reason=%s cf_pool_misses_window=%d error=%v",
+				settings.PolicyGen, route, selectedBackend, attemptBackend, fallbackUsed, mtProtoStatusField(lastResult.Reason), result.CFPoolMissCount, lastErr)
 		}
 	}
 
@@ -124,6 +155,7 @@ func (c *mtProtoRouteConnector) Connect(
 		lastResult.Reason = "all_mtproto_routes_failed"
 	}
 	lastResult.SelectedBackend = selectedBackend
+	lastResult.RouteGeneration = settings.PolicyGen
 	lastResult.ActualBackend = ""
 	lastResult.FallbackUsed = attempts > 1
 	if lastErr == nil {
@@ -252,6 +284,7 @@ func mtProtoStatusField(value string) string {
 type mtProtoWorkerConnector struct {
 	dial           mtProtoWorkerDial
 	dialContext    func(context.Context, string, string, string) (mtProtoFrameSocket, error)
+	dialTransportContext func(context.Context, workerTransport, string, string, string) (mtProtoFrameSocket, error)
 	flowsealParity bool
 }
 
@@ -259,6 +292,7 @@ func newMtProtoWorkerConnector() *mtProtoWorkerConnector {
 	return &mtProtoWorkerConnector{
 		dial:           dialFlowsealWorkerCandidate,
 		dialContext:    dialFlowsealWorkerCandidateContext,
+		dialTransportContext: dialWorkerTransportContext,
 		flowsealParity: true,
 	}
 }
@@ -370,6 +404,11 @@ func (c *mtProtoWorkerConnector) Connect(
 			return nil, result
 		}
 		candidate := candidates[i]
+		transport := candidate.Transport
+		if transport == "" {
+			transport = settings.Worker.Transport
+		}
+		transport = normalizeWorkerTransport(string(transport))
 		path := buildWorkerWSPath(effectiveDC, target, effectiveMedia, sessionID)
 		prefix := fmt.Sprintf(
 			"[MTProto] session_id=%s DC%d%s cfworker",
@@ -378,9 +417,10 @@ func (c *mtProtoWorkerConnector) Connect(
 			mediaTag(request.IsMedia),
 		)
 		logMtProtoRouteAttempt(
+			ctx,
 			request,
 			routeCFWorkerWS,
-			"session_id=%s signed_dc=%d effective_dc=%d effective_media=%t worker_host=%s worker_dst=%s destination_mode=%s effective_destination_mode=%s attempt=%d",
+			"session_id=%s signed_dc=%d effective_dc=%d effective_media=%t worker_host=%s worker_dst=%s destination_mode=%s effective_destination_mode=%s worker_transport=%s attempt=%d",
 			sessionID,
 			request.SignedDC,
 			effectiveDC,
@@ -389,6 +429,7 @@ func (c *mtProtoWorkerConnector) Connect(
 			target,
 			destination.ConfiguredDestinationMode,
 			destination.EffectiveDestinationMode,
+			transport,
 			i+1,
 		)
 
@@ -407,7 +448,9 @@ func (c *mtProtoWorkerConnector) Connect(
 					i+1,
 				)
 			}
-			if c.dialContext != nil {
+			if c.dialTransportContext != nil {
+				ws, err = c.dialTransportContext(ctx, transport, candidate.Domain, path, prefix)
+			} else if c.dialContext != nil {
 				ws, err = c.dialContext(ctx, candidate.Domain, path, prefix)
 			} else {
 				ws, err = c.dial(candidate.Domain, path, prefix)
@@ -466,11 +509,19 @@ func (c *mtProtoWorkerConnector) Connect(
 		if err != nil {
 			lastErr = err
 			lastReason = classifyWorkerConnectFailure(err)
+			if logWarn != nil {
+				logWarn.Printf("MTProto Worker dial failed session_id=%s worker_transport=%s worker_host=%s reason=%s attempt=%d error=%v",
+					sessionID, transport, candidate.Domain, lastReason, i+1, err)
+			}
 			continue
 		}
 
 		stopCancel := context.AfterFunc(ctx, ws.Close)
-		stream, err := mtProtoWorkerWebSocketConn(ws, workerRelayInit, candidate.Domain)
+		connectStream := mtProtoWorkerWebSocketConn
+		if transport == workerTransportLegacyWebSocket {
+			connectStream = mtProtoLegacyWorkerWebSocketConn
+		}
+		stream, err := connectStream(ws, workerRelayInit, candidate.Domain)
 		stopCancel()
 		if ctx.Err() != nil {
 			ws.Close()
@@ -495,6 +546,9 @@ func (c *mtProtoWorkerConnector) Connect(
 			stream = wrapMtProtoWorkerPayloadTrace(stream, request, sessionID, target)
 		}
 
+		if logInfo != nil {
+			logInfo.Printf("MTProto Worker connected session_id=%s worker_transport=%s worker_host=%s worker_dst=%s", sessionID, transport, candidate.Domain, target)
+		}
 		result.ActualBackend = mtProtoWorkerBackend
 		result.Reason = "connected"
 		return stream, result
