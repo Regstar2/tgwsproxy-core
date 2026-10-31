@@ -60,11 +60,18 @@ type OutboundCapability struct {
 }
 
 type OutboundResult struct {
+	RouteGeneration uint64
 	SelectedBackend string
 	ActualBackend   string
 	FallbackUsed    bool
 	Reason          string
 	Err             error
+	CFPoolMissCount int64
+}
+
+// LogCFPoolMiss reports logarithmically spaced samples of repeated pool misses.
+func LogCFPoolMiss(n int64) bool {
+	return n <= 0 || n&(n-1) == 0
 }
 
 type OutboundConnector interface {
