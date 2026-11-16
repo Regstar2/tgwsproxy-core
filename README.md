@@ -11,6 +11,9 @@
 
 Native runtime синхронизирован с `Regstar2/tg-ws-proxy-android` commit `baf61c29e345a604d3915dbcec516cca5bb9a2fc` (v1.11.6). Исходный Android-репозиторий при синхронизации не изменяется.
 
+
+**CF Proxy SNI/Host fix (16.11.2026):** перенесён из [tg-ws-proxy-android #156](https://github.com/Regstar2/tg-ws-proxy-android/issues/156) (commit `96b4c8a28c9be277cba2bafec118b47c570e9e25`). Для `cf_proxy_ws` TLS SNI использует базовый домен, а HTTP WebSocket Host сохраняет `kwsN.<domain>` и путь `/apiws`. Direct WS и Worker не изменены. Изменение проверяется Go-регрессионными тестами. Ограничение проверки сертификатов в существующем native WebSocket transport остаётся; см. [Android #158](https://github.com/Regstar2/tg-ws-proxy-android/issues/158).
+
 ## Статус проекта
 
 Стадия: **Prototype**.
