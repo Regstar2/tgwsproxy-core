@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha1"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"net"
 	"net/http"
@@ -10,6 +12,51 @@ import (
 	"reflect"
 	"testing"
 )
+
+func TestCFProxyPlainWebSocketUsesPort80AndValidatesUpgrade(t *testing.T) {
+	for _, valid := range []bool{true, false} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Host != "kws4.pool.example" || r.URL.Path != "/apiws" || r.Header.Get("Sec-WebSocket-Protocol") != "binary" {
+				t.Errorf("unexpected request: %s %s %v", r.Host, r.URL.Path, r.Header)
+			}
+			w.Header().Set("Upgrade", "websocket")
+			w.Header().Set("Connection", "Upgrade")
+			if valid {
+				accept := sha1.Sum([]byte(r.Header.Get("Sec-WebSocket-Key") + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+				w.Header().Set("Sec-WebSocket-Accept", base64.StdEncoding.EncodeToString(accept[:]))
+			}
+			w.WriteHeader(http.StatusSwitchingProtocols)
+		}))
+		ws, err := wsConnectPlainContextDial(context.Background(), "203.0.113.4", "kws4.pool.example", "/apiws", 2,
+			func(ctx context.Context, network, address string) (net.Conn, error) {
+				if network != "tcp" || address != "203.0.113.4:80" {
+					t.Errorf("unexpected dial: %s %s", network, address)
+				}
+				return (&net.Dialer{}).DialContext(ctx, network, server.Listener.Addr().String())
+			})
+		if ws != nil {
+			ws.Close()
+		}
+		server.Close()
+		if (ws != nil) != valid || (err == nil) != valid {
+			t.Fatalf("valid upgrade=%t, got connection=%t, err=%v", valid, ws != nil, err)
+		}
+	}
+}
+
+func TestCFProxyPlainWebSocketRequiresExplicitConfig(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want bool
+	}{
+		{"", false}, {"@cfproxy_no_tls=0", false}, {"@cfproxy_no_tls=1", true},
+	} {
+		_, settings, err := parseRuntimeConfig(tc.raw)
+		if err != nil || settings.CF.NoTLS != tc.want {
+			t.Fatalf("parse %q: got NoTLS=%t, err=%v", tc.raw, settings.CF.NoTLS, err)
+		}
+	}
+}
 
 func TestWebSocketTLSNameIsIndependentOfHTTPHost(t *testing.T) {
 	cases := []struct {
@@ -22,16 +69,13 @@ func TestWebSocketTLSNameIsIndependentOfHTTPHost(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			observed := make(chan [3]string, 1)
-			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				observed <- [3]string{r.TLS.ServerName, r.Host, r.URL.Path}
-				w.Header().Set("Connection", "Upgrade")
-				w.Header().Set("Upgrade", "websocket")
-				w.WriteHeader(http.StatusSwitchingProtocols)
-			}))
-			defer server.Close()
+			wantSNI := tc.serverName
+			if wantSNI == "" {
+				wantSNI = tc.host
+			}
+			server, roots, observed := newNativeVerifiedWSTestServer(t, []string{wantSNI}, false)
 
-			ws, err := wsConnectWithCurvesContextDialSNI(
+			ws, err := wsConnectWithCurvesContextDialSNIWithRoots(
 				context.Background(), tc.dialIP, tc.host, tc.serverName, "/apiws", 2,
 				classicalTLSCurves(),
 				func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -39,17 +83,13 @@ func TestWebSocketTLSNameIsIndependentOfHTTPHost(t *testing.T) {
 						t.Errorf("unexpected dial: %s %s", network, address)
 					}
 					return (&net.Dialer{}).DialContext(ctx, "tcp", server.Listener.Addr().String())
-				},
+				}, roots,
 			)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer ws.Close()
 
-			wantSNI := tc.serverName
-			if wantSNI == "" {
-				wantSNI = tc.host
-			}
 			select {
 			case got := <-observed:
 				if got != ([3]string{wantSNI, tc.host, "/apiws"}) {

@@ -23,6 +23,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -310,6 +311,7 @@ type resolvedIPs struct {
 }
 
 type cfProxyConfig struct {
+	NoTLS    bool
 	Enabled  bool
 	Priority bool
 	Only     bool
@@ -734,7 +736,7 @@ func (d *compatibleWebSocketTLSDialer) connect(ip, domain, path string, timeout 
 	// Some networks drop the larger hybrid post-quantum ClientHello used by Go's defaults.
 	ws, err := dial(ip, domain, path, timeout, classicalTLSCurves())
 	var stageErr *wsStageError
-	if err == nil || d.defaultAttempted || !errors.As(err, &stageErr) || stageErr.Stage != "tls_handshake" || errors.Is(err, context.Canceled) || (d.ctx != nil && d.ctx.Err() != nil) {
+	if err == nil || d.defaultAttempted || !errors.As(err, &stageErr) || stageErr.Stage != "tls_handshake" || errors.Is(err, context.Canceled) || isCertificateVerificationFailure(err) || (d.ctx != nil && d.ctx.Err() != nil) {
 		return ws, err
 	}
 	d.defaultAttempted = true
@@ -753,9 +755,9 @@ func classicalTLSCurves() []tls.CurveID { return []tls.CurveID{tls.X25519, tls.C
 
 func webSocketTLSConfig(domain string, curves []tls.CurveID) *tls.Config {
 	return &tls.Config{
-		InsecureSkipVerify: true,
-		ServerName:         domain,
-		CurvePreferences:   curves,
+		ServerName:       domain,
+		CurvePreferences: curves,
+		RootCAs:         nativeTLSRootCAs(),
 	}
 }
 
@@ -772,6 +774,29 @@ func wsConnectWithCurvesContextDial(ctx context.Context, ip, domain, path string
 }
 
 func wsConnectWithCurvesContextDialSNI(ctx context.Context, ip, domain, serverName, path string, timeout float64, curves []tls.CurveID, dialContext func(context.Context, string, string) (net.Conn, error)) (*RawWebSocket, error) {
+	return wsConnectWithCurvesContextDialSNIWithRoots(ctx, ip, domain, serverName, path, timeout, curves, dialContext, nil)
+}
+
+// wsConnectWithCurvesContextDialSNIWithRoots lets local tests supply trusted CAs
+// without disabling verification or changing the production trust store.
+func wsConnectWithCurvesContextDialSNIWithRoots(ctx context.Context, ip, domain, serverName, path string, timeout float64, curves []tls.CurveID, dialContext func(context.Context, string, string) (net.Conn, error), roots *x509.CertPool) (*RawWebSocket, error) {
+	if serverName == "" {
+		serverName = domain
+	}
+	tlsCfg := webSocketTLSConfig(serverName, curves)
+	if roots != nil {
+		tlsCfg.RootCAs = roots
+	}
+	return wsConnectTransport(ctx, ip, domain, path, 443, timeout, tlsCfg, dialContext)
+}
+
+const cfPlainWebSocketPort = 80
+
+func wsConnectPlainContextDial(ctx context.Context, ip, domain, path string, timeout float64, dialContext func(context.Context, string, string) (net.Conn, error)) (*RawWebSocket, error) {
+	return wsConnectTransport(ctx, ip, domain, path, cfPlainWebSocketPort, timeout, nil, dialContext)
+}
+
+func wsConnectTransport(ctx context.Context, ip, domain, path string, port int, timeout float64, tlsCfg *tls.Config, dialContext func(context.Context, string, string) (net.Conn, error)) (*RawWebSocket, error) {
 	if path == "" {
 		path = "/apiws"
 	}
@@ -788,15 +813,10 @@ func wsConnectWithCurvesContextDialSNI(ctx context.Context, ip, domain, serverNa
 		Timeout: time.Duration(dialTimeout * float64(time.Second)),
 	}
 
-	if serverName == "" {
-		serverName = domain
-	}
-	tlsCfg := webSocketTLSConfig(serverName, curves)
-
 	if dialContext == nil {
 		dialContext = dialer.DialContext
 	}
-	rawConn, err := dialContext(ctx, "tcp", joinAddr(ip, 443))
+	rawConn, err := dialContext(ctx, "tcp", joinAddr(ip, port))
 	if err != nil {
 		return nil, &wsStageError{Stage: "tcp_dial", Err: err}
 	}
@@ -804,13 +824,17 @@ func wsConnectWithCurvesContextDialSNI(ctx context.Context, ip, domain, serverNa
 	stopCancel := context.AfterFunc(ctx, func() { _ = rawConn.Close() })
 	defer stopCancel()
 
-	tlsConn := tls.Client(rawConn, tlsCfg)
-	_ = tlsConn.SetDeadline(time.Now().Add(time.Duration(timeout * float64(time.Second))))
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		_ = tlsConn.Close()
-		return nil, &wsStageError{Stage: "tls_handshake", Err: err}
+	var conn net.Conn = rawConn
+	if tlsCfg != nil {
+		tlsConn := tls.Client(rawConn, tlsCfg)
+		_ = tlsConn.SetDeadline(time.Now().Add(time.Duration(timeout * float64(time.Second))))
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			_ = tlsConn.Close()
+			return nil, &wsStageError{Stage: "tls_handshake", Err: err}
+		}
+		_ = tlsConn.SetDeadline(time.Time{})
+		conn = tlsConn
 	}
-	_ = tlsConn.SetDeadline(time.Time{})
 
 	wsKeyBytes := make([]byte, 16)
 	_, _ = rand.Read(wsKeyBytes)
@@ -831,24 +855,32 @@ func wsConnectWithCurvesContextDialSNI(ctx context.Context, ip, domain, serverNa
 		path, domain, wsKey,
 	)
 
-	_ = tlsConn.SetWriteDeadline(time.Now().Add(time.Duration(timeout * float64(time.Second))))
-	_, err = tlsConn.Write([]byte(req))
+	_ = conn.SetWriteDeadline(time.Now().Add(time.Duration(timeout * float64(time.Second))))
+	_, err = conn.Write([]byte(req))
 	if err != nil {
-		_ = tlsConn.Close()
+		_ = conn.Close()
 		return nil, &wsStageError{Stage: "ws_upgrade_write", Err: err}
 	}
-	_ = tlsConn.SetWriteDeadline(time.Time{})
+	_ = conn.SetWriteDeadline(time.Time{})
 
 	// Use buffered reader for efficient header parsing
-	bufReader := bufio.NewReaderSize(tlsConn, 4096)
+	bufReader := bufio.NewReaderSize(conn, 4096)
 
-	_ = tlsConn.SetReadDeadline(time.Now().Add(time.Duration(timeout * float64(time.Second))))
+	_ = conn.SetReadDeadline(time.Now().Add(time.Duration(timeout * float64(time.Second))))
 
 	var responseLines []string
 	for {
-		line, err := bufReader.ReadString('\n')
+		var line string
+		var err error
+		if tlsCfg == nil {
+			var lineBytes []byte
+			lineBytes, err = bufReader.ReadSlice('\n')
+			line = string(lineBytes)
+		} else {
+			line, err = bufReader.ReadString('\n')
+		}
 		if err != nil {
-			_ = tlsConn.Close()
+			_ = conn.Close()
 			return nil, &wsStageError{Stage: "ws_upgrade_read", Err: err}
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -857,14 +889,14 @@ func wsConnectWithCurvesContextDialSNI(ctx context.Context, ip, domain, serverNa
 		}
 		responseLines = append(responseLines, line)
 		if len(responseLines) > 100 {
-			_ = tlsConn.Close()
+			_ = conn.Close()
 			return nil, &wsStageError{Stage: "ws_upgrade_read", Err: fmt.Errorf("too many HTTP headers")}
 		}
 	}
-	_ = tlsConn.SetReadDeadline(time.Time{})
+	_ = conn.SetReadDeadline(time.Time{})
 
 	if len(responseLines) == 0 {
-		_ = tlsConn.Close()
+		_ = conn.Close()
 		return nil, &WsHandshakeError{StatusCode: 0, StatusLine: "empty response"}
 	}
 
@@ -876,12 +908,16 @@ func wsConnectWithCurvesContextDialSNI(ctx context.Context, ip, domain, serverNa
 	}
 
 	if statusCode == 101 {
+		if tlsCfg == nil && !flowsealValidUpgradeResponse(responseLines[1:], wsKeyBytes) {
+			_ = conn.Close()
+			return nil, &WsHandshakeError{StatusCode: 101, StatusLine: "invalid WebSocket upgrade response"}
+		}
 		if err := ctx.Err(); err != nil {
-			_ = tlsConn.Close()
+			_ = conn.Close()
 			return nil, err
 		}
 		ws := &RawWebSocket{
-			conn:      tlsConn,
+			conn:      conn,
 			bufReader: bufReader,
 		}
 		return ws, nil
@@ -896,7 +932,7 @@ func wsConnectWithCurvesContextDialSNI(ctx context.Context, ip, domain, serverNa
 			headers[k] = v
 		}
 	}
-	_ = tlsConn.Close()
+	_ = conn.Close()
 	return nil, &WsHandshakeError{
 		StatusCode: statusCode,
 		StatusLine: firstLine,
@@ -3140,6 +3176,8 @@ func parseRuntimeConfig(raw string) (map[int]string, runtimeSettings, error) {
 				cfg.Priority = parseBoolValue(val)
 			case "cfproxy_only":
 				cfg.Only = parseBoolValue(val)
+			case "cfproxy_no_tls":
+				cfg.NoTLS = parseBoolValue(val)
 			case "cfproxy_domain":
 				if val != "" {
 					if normalized, ok := tgwsroute.NormalizeCFDomain(val); ok {
@@ -3216,11 +3254,6 @@ func parseRuntimeConfig(raw string) (map[int]string, runtimeSettings, error) {
 				settings.AdaptiveRouteStats = val
 			case "auto_strategy":
 				settings.AutoStrategy = val
-			case "route_order":
-				settings.ExplicitRouteOrder = parseRouteOrder(val)
-				if len(settings.ExplicitRouteOrder) > 0 {
-					settings.PolicyPresent = true
-				}
 			case "mtproto_fake_tls_domain", "fake_tls_domain":
 				settings.MtProtoFakeTLSDomain = mtproxyfrontend.NormalizeFakeTLSDomain(val)
 			case "mtproto_masking_passthrough", "fake_tls_masking_passthrough":
@@ -3229,7 +3262,18 @@ func parseRuntimeConfig(raw string) (map[int]string, runtimeSettings, error) {
 				settings.MtProtoWorkerPreconnect = parseBoolValue(val)
 			case "force_test_dc":
 				settings.ForceTestDC = parseBoolValue(val)
-			case "route_direct_ws":
+			case "route_order":
+                routes, err := parseOrderedRoutes(val)
+                if err != nil { return nil, settings, err }
+                settings.OrderedPolicy = true
+                settings.PolicyPresent = true
+                settings.OrderedRoutes = routes
+            case "route_awg_warp":
+                settings.PolicyPresent = true
+                settings.AllowAWG = parseBoolValue(val)
+            case "awg_warp_config_path":
+                settings.AWGConfigPath = val
+            case "route_direct_ws":
 				settings.PolicyPresent = true
 				settings.AllowDirect = parseBoolValue(val)
 			case "route_worker_ws":
@@ -3238,9 +3282,6 @@ func parseRuntimeConfig(raw string) (map[int]string, runtimeSettings, error) {
 			case "route_cf_proxy_ws":
 				settings.PolicyPresent = true
 				settings.AllowCFProxy = parseBoolValue(val)
-			case "route_awg_warp":
-				settings.PolicyPresent = true
-				settings.AllowAWG = parseBoolValue(val)
 			case "route_tcp_fallback":
 				settings.PolicyPresent = true
 				settings.AllowTCP = parseBoolValue(val)
@@ -3337,6 +3378,12 @@ func (mtProtoLogWriter) Printf(format string, args ...any) {
 }
 
 func startMtProtoWorkerPreconnect(dcOptMap map[int]string, settings runtimeSettings) {
+    // Do not open a lower-priority Worker transport merely for speculative warmup.
+    if settings.OrderedPolicy &&
+        (len(settings.OrderedRoutes) == 0 || settings.OrderedRoutes[0] != routeCFWorkerWS) {
+        stopMtProtoWorkerPreconnect(false)
+        return
+    }
 	workerDomains := workerWarmupDomains(settings)
 	active := workerWsPreconnectActiveForSettings(settings)
 	if !settings.workerRouteAvailable() || !active || len(workerDomains) == 0 {
@@ -3462,6 +3509,10 @@ func StartMtProtoProxy(cHost *C.char, port C.int, cSecret *C.char, cRuntimeConfi
 		logError.Printf("MTProto parseRuntimeConfig: %v", err)
 		return -4
 	}
+	if err := validateMtProtoRequestedRoutes(settings); err != nil {
+		logError.Printf("MTProto frontend start rejected before runtime change: %v", err)
+		return -4
+	}
 	setRuntimeSettings(settings)
 	setCfProxyConfig(settings.CF)
 	dcOptMu.Lock()
@@ -3489,6 +3540,51 @@ func StartMtProtoProxy(cHost *C.char, port C.int, cSecret *C.char, cRuntimeConfi
 	default:
 		return -4
 	}
+}
+
+//export UpdateMtProtoRoutePolicy
+// Atomically change policy for future MTProto sessions without restarting the listener.
+func UpdateMtProtoRoutePolicy(cRuntimeConfig *C.char) C.int {
+    dcMap, settings, err := parseRuntimeConfig(C.GoString(cRuntimeConfig))
+    if err != nil || !settings.OrderedPolicy {
+        if logError != nil { logError.Printf("MTProto route policy update rejected: %v", err) }
+        return -4
+    }
+    if err := validateMtProtoRequestedRoutes(settings); err != nil {
+        if logError != nil { logError.Printf("MTProto route policy update rejected: %v", err) }
+        return -4
+    }
+    // Configure a newly enabled AWG route before publishing the new policy.
+    // Unconfigured AWG may be skipped only when another explicitly allowed path exists.
+    if settings.AllowAWG {
+        previous := globalAWGWarpRouteRuntime.Policy()
+        if settings.AWGConfigPath == "" && len(settings.OrderedRoutes) == 1 {
+            return -4
+        }
+        if settings.AWGConfigPath != "" &&
+            (!previous.Enabled || previous.ConfigPath != settings.AWGConfigPath) {
+            if err := globalAWGWarpRouteRuntime.Configure(
+                settings.AWGConfigPath, true, false, len(settings.OrderedRoutes) > 1,
+            ); err != nil {
+                if logWarn != nil { logWarn.Printf("AWG route configuration failed: %v", err) }
+                if len(settings.OrderedRoutes) == 1 { return -4 }
+            }
+        }
+    }
+    setRuntimeSettings(settings)
+    setCfProxyConfig(settings.CF)
+    dcOptMu.Lock()
+    dcOpt = dcMap
+    dcOptMu.Unlock()
+    // Cancel preconnect for routes removed from the policy. Keep connections
+    // already owned by existing sessions; do not close the Worker pool here.
+    startMtProtoWorkerPreconnect(dcMap, settings)
+    if logInfo != nil {
+        logInfo.Printf("MTProto route policy updated network=%s order=%s generation=%d",
+            settings.NetworkProfileType, strings.Join(routeKindStrings(settings.OrderedRoutes), "|"),
+            getRuntimeSettings().PolicyGen)
+    }
+    return 0
 }
 
 //export StopMtProtoProxy

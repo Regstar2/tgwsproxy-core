@@ -61,7 +61,6 @@ type runtimeSettings struct {
 	NetworkProfileLabel       string
 	AdaptiveRouteStats        string
 	AutoStrategy              string
-	ExplicitRouteOrder        []routeKind
 	MtProtoFakeTLSDomain      string
 	MtProtoMaskingPassthrough bool
 	MtProtoWorkerPreconnect   bool
@@ -71,8 +70,11 @@ type runtimeSettings struct {
 	AllowDirect   bool
 	AllowWorker   bool
 	AllowCFProxy  bool
-	AllowAWG      bool
 	AllowTCP      bool
+	AllowAWG      bool
+	AWGConfigPath string
+	OrderedPolicy bool
+	OrderedRoutes []routeKind
 	Preferred     routeKind // empty means "no explicit preferred"
 	AllowFallback bool
 	PolicyGen     uint64
@@ -117,8 +119,29 @@ func setRuntimeSettings(cfg runtimeSettings) {
 	resetProxyRouteDisplayState()
 	cfPool.SetManualDomains(cfg.CFManualDomains)
 	cfPool.SetCachedUpstreamDomains(cfg.CFCachedUpstream)
+	if prev.CF.NoTLS != cfg.CF.NoTLS {
+		cfPool.ResetCooldowns()
+	}
 	applyAdaptiveProfile(cfg)
 	logPolicyChange(prev, cfg)
+}
+
+// parseOrderedRoutes rejects an empty or unrecognizable strict route chain.
+func parseOrderedRoutes(raw string) ([]routeKind, error) {
+    var result []routeKind
+    seen := make(map[routeKind]bool)
+    for _, candidate := range strings.Split(raw, "|") {
+        route := parsePreferredRoute(candidate)
+        if route == "" || seen[route] {
+            continue
+        }
+        seen[route] = true
+        result = append(result, route)
+    }
+    if len(result) == 0 {
+        return nil, fmt.Errorf("ordered policy contains no supported routes")
+    }
+    return result, nil
 }
 
 func parsePreferredRoute(raw string) routeKind {
@@ -130,38 +153,23 @@ func parsePreferredRoute(raw string) routeKind {
 		return routeCFWorkerWS
 	case "cf_proxy_ws", "cf":
 		return routeCFProxyWS
-	case "awg_warp", "awg", "warp":
-		return routeAWGWarp
 	case "tcp_fallback", "tcp":
 		return routeTCPFallback
+	case "awg_warp", "awg":
+		return routeAWGWarp
 	default:
 		return ""
 	}
 }
 
-func parseRouteOrder(raw string) []routeKind {
-	parts := strings.Split(raw, "|")
-	out := make([]routeKind, 0, len(parts))
-	seen := make(map[routeKind]struct{}, len(parts))
-	for _, part := range parts {
-		route := parsePreferredRoute(part)
-		if route == "" {
-			continue
-		}
-		if _, exists := seen[route]; exists {
-			continue
-		}
-		seen[route] = struct{}{}
-		out = append(out, route)
-	}
-	return out
-}
-
 func allowedRoutesList(s runtimeSettings) []routeKind {
+    if s.OrderedPolicy {
+        return append([]routeKind(nil), s.OrderedRoutes...)
+    }
 	if !s.PolicyPresent {
 		return nil
 	}
-	out := make([]routeKind, 0, 5)
+	out := make([]routeKind, 0, 4)
 	if s.AllowDirect {
 		out = append(out, routeDirectWS)
 	}
@@ -170,9 +178,6 @@ func allowedRoutesList(s runtimeSettings) []routeKind {
 	}
 	if s.AllowCFProxy {
 		out = append(out, routeCFProxyWS)
-	}
-	if s.AllowAWG {
-		out = append(out, routeAWGWarp)
 	}
 	if s.AllowTCP {
 		out = append(out, routeTCPFallback)
@@ -203,7 +208,10 @@ func logPolicyChange(old, cur runtimeSettings) {
 	logInfo.Printf("Policy changed generation=%d oldRoutes=%s newRoutes=%s preferred=%s fallback=%t",
 		cur.PolicyGen, oldAllowed, newAllowed, cur.Preferred, cur.AllowFallback)
 
-	// Close pools for disabled routes (best-effort). This prevents "ghost" worker/direct usage.
+	// Ordered policy changes must never close pools used by existing MTProto sessions.
+    if cur.OrderedPolicy {
+        return
+    }
 	if !cur.AllowWorker {
 		workerPool.CloseAll()
 	}
@@ -310,6 +318,15 @@ func newCFDomainPool() *tgwsroute.CFDomainPool {
 // ---------------------------------------------------------------------------
 
 func routesForMode(mode connectionMode, settings runtimeSettings, skipDirect bool) []routeKind {
+    if settings.OrderedPolicy {
+        ordered := allowedRoutesList(settings)
+        if !skipDirect { return ordered }
+        filtered := make([]routeKind, 0, len(ordered))
+        for _, route := range ordered {
+            if route != routeDirectWS { filtered = append(filtered, route) }
+        }
+        return filtered
+    }
 	base := tgwsroute.RoutesForMode(mode, toRouteSettings(settings), skipDirect)
 	return filterRoutesByPolicy(settings, base, "routesForMode")
 }
@@ -319,6 +336,12 @@ func primaryRoutesBeforeDirectWS(mode connectionMode, settings runtimeSettings) 
 }
 
 func isRouteAllowedByPolicy(settings runtimeSettings, r routeKind) bool {
+    if settings.OrderedPolicy {
+        for _, candidate := range settings.OrderedRoutes {
+            if candidate == r { return true }
+        }
+        return false
+    }
 	if !settings.PolicyPresent {
 		return true
 	}
@@ -329,8 +352,6 @@ func isRouteAllowedByPolicy(settings runtimeSettings, r routeKind) bool {
 		return settings.AllowWorker
 	case routeCFProxyWS:
 		return settings.AllowCFProxy
-	case routeAWGWarp:
-		return settings.AllowAWG
 	case routeTCPFallback:
 		return settings.AllowTCP
 	default:
@@ -760,7 +781,7 @@ func cfProxyFallbackWithPool(ctx context.Context, client net.Conn, init []byte, 
 		func() {
 			defer releaseReservation()
 			ok, reason, failureKind, latencyMs = cfProxyDialHost(
-				ctx, client, init, label, dc, isMedia, splitter, host, baseDomain, releaseReservation,
+				ctx, client, init, label, dc, isMedia, splitter, host, baseDomain, settings.CF.NoTLS, releaseReservation,
 			)
 			if !ok {
 				health = cfPool.MarkFailure(wsDC, baseDomain, failureKind, latencyMs)
@@ -797,7 +818,7 @@ func cfProxyFallbackWithPool(ctx context.Context, client net.Conn, init []byte, 
 	return false, "cfproxy_all_domains_failed"
 }
 
-func cfProxyDialHost(ctx context.Context, client net.Conn, init []byte, label string, dc int, isMedia bool, splitter *MsgSplitter, host, baseDomain string, onConnected func()) (bool, string, tgwsroute.CFFailureKind, int64) {
+func cfProxyDialHost(ctx context.Context, client net.Conn, init []byte, label string, dc int, isMedia bool, splitter *MsgSplitter, host, baseDomain string, noTLS bool, onConnected func()) (bool, string, tgwsroute.CFFailureKind, int64) {
 	mTag := mediaTag(isMedia)
 	started := time.Now()
 
@@ -811,9 +832,9 @@ func cfProxyDialHost(ctx context.Context, client net.Conn, init []byte, label st
 	var ws *RawWebSocket
 	var lastErr error
 	usedTarget := "hostname"
-	dialer := compatibleWebSocketTLSDialer{ctx: ctx, serverName: baseDomain}
+	connect := newCFProxyWebSocketDialer(ctx, baseDomain, prefix, noTLS)
 
-	ws, lastErr = dialer.connect(host, host, "/apiws", 10)
+	ws, lastErr = connect(host, host, "/apiws", 10)
 	if lastErr != nil {
 		logDomainConnectFailure(prefix, host, host, lastErr)
 	}
@@ -822,7 +843,7 @@ func cfProxyDialHost(ctx context.Context, client net.Conn, init []byte, label st
 		if ws != nil {
 			break
 		}
-		ws, lastErr = dialer.connect(ip, host, "/apiws", 10)
+		ws, lastErr = connect(ip, host, "/apiws", 10)
 		if lastErr == nil {
 			usedTarget = ip
 			break
@@ -853,7 +874,11 @@ func cfProxyDialHost(ctx context.Context, client net.Conn, init []byte, label st
 		onConnected()
 	}
 
-	summary := bridgeWS(ctx, client, ws, label, dc, host, 443, isMedia, splitter, bridgeWSMeta{route: routeCFProxyWS})
+	port := 443
+	if noTLS {
+		port = cfPlainWebSocketPort
+	}
+	summary := bridgeWS(ctx, client, ws, label, dc, host, port, isMedia, splitter, bridgeWSMeta{route: routeCFProxyWS})
 	return true, summary.String(), "", elapsedMillis(started)
 }
 
